@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # The Java Spring Boot Backend Service
   scheduler-service:
@@ -8,17 +6,45 @@ services:
     ports:
       - "8080:8080"
     container_name: scheduler-service
+    # This service will now wait for Redis and RabbitMQ to be fully "healthy" before it starts.
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 
   # The React Frontend Service (served by Nginx)
   frontend:
     build:
-      # The build context is now the path to the React project.
-      # Docker Compose will automatically find and use the Dockerfile
-      # located inside this directory.
       context: ./dag-ui-futuristic
     ports:
       - "80:80"
     container_name: frontend
     depends_on:
       - scheduler-service
+
+  # The Redis State Store Service with Healthcheck
+  redis:
+    image: "redis:7-alpine"
+    container_name: redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # The RabbitMQ Message Broker Service with Healthcheck
+  rabbitmq:
+    image: "rabbitmq:3.13-management-alpine"
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
