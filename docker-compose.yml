@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  # The Java Spring Boot Backend Service
+  scheduler-service:
+    build:
+      context: ./scheduler-service
+    ports:
+      - "8080:8080"
+    container_name: scheduler-service
+
+  # The React Frontend Service (served by Nginx)
+  frontend:
+    build:
+      # The build context is now the path to the React project.
+      # Docker Compose will automatically find and use the Dockerfile
+      # located inside this directory.
+      context: ./dag-ui-futuristic
+    ports:
+      - "80:80"
+    container_name: frontend
+    depends_on:
+      - scheduler-service
+
