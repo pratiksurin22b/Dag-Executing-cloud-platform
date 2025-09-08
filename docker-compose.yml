@@ -6,7 +6,6 @@ services:
     ports:
       - "8080:8080"
     container_name: scheduler-service
-    # This service will now wait for Redis and RabbitMQ to be fully "healthy" before it starts.
     depends_on:
       redis:
         condition: service_healthy
@@ -23,7 +22,7 @@ services:
     depends_on:
       - scheduler-service
 
-  # The Redis State Store Service with Healthcheck
+  # The Redis State Store Service
   redis:
     image: "redis:7-alpine"
     container_name: redis
@@ -35,7 +34,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # The RabbitMQ Message Broker Service with Healthcheck
+  # The RabbitMQ Message Broker Service
   rabbitmq:
     image: "rabbitmq:3.13-management-alpine"
     container_name: rabbitmq
@@ -47,4 +46,18 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # --- NEW: The Generic Worker Service ---
+  generic-worker:
+    build:
+      context: ./generic-worker
+    container_name: generic-worker
+    # The worker must wait for RabbitMQ to be ready before it starts.
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    # This is the crucial part that gives this container control over Docker.
+    # It maps the host's Docker socket into the container.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
