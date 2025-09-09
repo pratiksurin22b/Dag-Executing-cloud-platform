@@ -33,12 +33,26 @@ public class ResultListener {
             String taskName = resultNode.get("taskName").asText();
             String status = resultNode.get("status").asText();
 
-            // Step 1: Update the task's final status in Redis
+            // <-- NEW LOGIC STARTS HERE -->
+
+            // Step 1: Extract and save the logs from the result message.
+            if (resultNode.has("logs") && resultNode.get("logs").isArray()) {
+                // Convert the logs array to a JSON string for storage in Redis.
+                String logsJson = resultNode.get("logs").toString();
+                String taskLogsKey = String.format("dag:%s:task:%s:logs", dagId, taskName);
+
+                redisTemplate.opsForValue().set(taskLogsKey, logsJson);
+                LOGGER.info("Saved {} log lines for task '{}' in DAG '{}'", resultNode.get("logs").size(), taskName, dagId);
+            }
+
+            // <-- NEW LOGIC ENDS HERE -->
+
+            // Step 2: Update the task's final status in Redis.
             String taskStatusKey = String.format("dag:%s:task:%s:status", dagId, taskName);
             redisTemplate.opsForValue().set(taskStatusKey, status);
             LOGGER.info("Updated status for task '{}' in DAG '{}' to {}", taskName, dagId, status);
 
-            // Step 2: If the task succeeded, re-evaluate the DAG to run the next tasks
+            // Step 3: If the task succeeded, re-evaluate the DAG to run the next tasks.
             if ("SUCCEEDED".equals(status)) {
                 LOGGER.info("Task succeeded. Triggering DAG re-evaluation for DAG ID: {}", dagId);
                 orchestratorService.evaluateDag(dagId);

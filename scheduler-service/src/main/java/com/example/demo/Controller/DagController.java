@@ -1,6 +1,7 @@
 package com.example.demo.Controller;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.example.demo.service.OrchestratorService;
+import com.example.demo.dto.DagStatusResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,6 +26,16 @@ public class DagController {
     @Autowired
     public DagController(OrchestratorService orchestratorService) {
         this.orchestratorService = orchestratorService;
+    }
+
+    @GetMapping("/{dagId}")
+    public ResponseEntity<Object> getDagStatus(@PathVariable String dagId) {
+        DagStatusResponse statusResponse = orchestratorService.getDagStatus(dagId);
+        if (statusResponse != null) {
+            return ResponseEntity.ok(statusResponse);
+        } else {
+            return ResponseEntity.notFound().build();
+        }
     }
 
     @PostMapping

@@ -1,6 +1,7 @@
 package com.example.demo.service;
 
 import com.example.demo.config.RabbitMQConfig;
+import com.example.demo.dto.DagStatusResponse;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -10,6 +11,10 @@ import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import com.fasterxml.jackson.core.type.TypeReference;
 
 import java.io.IOException;
 import java.util.UUID;
@@ -86,6 +91,44 @@ public class OrchestratorService {
                     String dependencyStatus = redisTemplate.opsForValue().get("dag:" + dagId + ":task:" + dependencyName + ":status");
                     return "SUCCEEDED".equals(dependencyStatus);
                 });
+    }
+
+    public DagStatusResponse getDagStatus(String dagId) {
+        try {
+            String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
+            if (dagJson == null) {
+                LOGGER.warn("Status requested for non-existent DAG ID: {}", dagId);
+                return null;
+            }
+
+            JsonNode dagPayload = objectMapper.readTree(dagJson);
+            String dagName = dagPayload.get("dagName").asText();
+            List<DagStatusResponse.TaskStatus> taskStatuses = new ArrayList<>();
+
+            for (JsonNode taskNode : dagPayload.get("tasks")) {
+                String taskName = taskNode.get("name").asText();
+                String status = redisTemplate.opsForValue().get("dag:" + dagId + ":task:" + taskName + ":status");
+
+                // Fetch logs if they exist
+                String logsJson = redisTemplate.opsForValue().get("dag:" + dagId + ":task:" + taskName + ":logs");
+                List<String> logs = (logsJson != null)
+                        ? objectMapper.readValue(logsJson, new TypeReference<List<String>>(){})
+                        : Collections.emptyList();
+
+                List<String> dependsOn = new ArrayList<>();
+                if (taskNode.has("depends_on")) {
+                    for (JsonNode depNode : taskNode.get("depends_on")) {
+                        dependsOn.add(depNode.asText());
+                    }
+                }
+                taskStatuses.add(new DagStatusResponse.TaskStatus(taskName, status, dependsOn, logs));
+            }
+
+            return new DagStatusResponse(dagId, dagName, taskStatuses);
+        } catch (IOException e) {
+            LOGGER.error("Failed to construct DAG status for ID: {}", dagId, e);
+            return null;
+        }
     }
 
     private void dispatchTask(String dagId, JsonNode taskNode) {

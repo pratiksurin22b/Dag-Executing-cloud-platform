@@ -1,39 +1,123 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import jsyaml from 'js-yaml';
-import { Edit3, Upload, FileText } from 'lucide-react';
+import { Edit3, CheckCircle, XCircle, Loader, Clock, GitBranch } from 'lucide-react';
 
+// A more complex, self-contained DAG to better showcase the UI's capabilities
 const sampleYaml = `apiVersion: v1
-dagName: "futuristic-pipeline"
+dagName: "complex-system-readiness-check"
 tasks:
-  - name: "initiate-telemetry"
+  - name: "initialize-system"
     type: "command"
     image: "ubuntu:latest"
-    command: ["/bin/bash", "-c", "echo 'Telemetry data stream initiated...'"]
+    command: ["/bin/bash", "-c", "echo 'System initialization started...' && sleep 2 && echo 'Initialization complete.'"]
+  - name: "check-database-connection"
+    type: "command"
+    image: "ubuntu:latest"
+    depends_on: ["initialize-system"]
+    command: ["/bin/bash", "-c", "echo 'Pinging database...' && sleep 4 && echo 'Database connection OK.'"]
+  - name: "check-storage-access"
+    type: "command"
+    image: "ubuntu:latest"
+    depends_on: ["initialize-system"]
+    command: ["/bin/bash", "-c", "echo 'Verifying storage...' && sleep 2 && echo 'Storage access OK.'"]
+  - name: "run-system-diagnostics"
+    type: "command"
+    image: "ubuntu:latest"
+    depends_on: ["check-database-connection", "check-storage-access"]
+    command: ["/bin/bash", "-c", "echo 'Running full system diagnostics...' && sleep 5 && echo 'All systems nominal.'"]
+  - name: "report-system-ready"
+    type: "command"
+    image: "ubuntu:latest"
+    depends_on: ["run-system-diagnostics"]
+    command: ["/bin/bash", "-c", "echo 'SUCCESS: System is fully operational and ready.'"]
 `;
 
-const DagSubmitter = () => {
+const apiUrl = '/api/v1/dags'; // This will be correctly proxied by Nginx in Docker
+
+// A small, reusable component to display a status icon based on the task's state.
+const StatusIcon = ({ status }) => {
+    switch (status) {
+        case 'SUCCEEDED': return <CheckCircle size={20} color="#00ff8c" data-testid="status-succeeded" />;
+        case 'FAILED': return <XCircle size={20} color="#ff4d4d" data-testid="status-failed" />;
+        case 'QUEUED': return <Loader size={20} color="#00f5ff" className="animate-spin" data-testid="status-queued" />;
+        case 'PENDING': return <Clock size={20} color="#94a3b8" data-testid="status-pending" />;
+        default: return <Clock size={20} color="#94a3b8" />;
+    }
+};
+
+// A component to render a single task's status, dependencies, and logs.
+const TaskItem = ({ task }) => (
+    <div style={styles.taskItem}>
+        <div style={styles.taskHeader}>
+            <StatusIcon status={task.status} />
+            <span style={styles.taskName}>{task.name}</span>
+            <span style={styles.taskStatus}>{task.status || 'PENDING'}</span>
+        </div>
+        {task.dependsOn && task.dependsOn.length > 0 && (
+            <div style={styles.dependencies}>
+                <GitBranch size={14} color="#94a3b8" />
+                <span>Depends on: {task.dependsOn.join(', ')}</span>
+            </div>
+        )}
+        {task.logs && task.logs.length > 0 && (
+            <div style={styles.logs}>
+                {task.logs.map((log, index) => <div key={index}>> {log}</div>)}
+            </div>
+        )}
+    </div>
+);
+
+// The main component, now acting as a full dashboard.
+const DagMonitor = () => {
     const [yamlText, setYamlText] = useState(sampleYaml);
-    const [response, setResponse] = useState(null);
+    const [dagState, setDagState] = useState(null); // Will hold the entire state of the DAG run
     const [error, setError] = useState('');
-    const [activeTab, setActiveTab] = useState('editor');
-    const [isDragging, setIsDragging] = useState(false);
-    const fileInputRef = useRef(null);
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const pollingIntervalRef = useRef(null);
+
+    // This is the core of the real-time functionality.
+    // It starts polling for updates after a DAG is successfully submitted.
+    useEffect(() => {
+        // Stop any previous polling if it exists
+        if (pollingIntervalRef.current) {
+            clearInterval(pollingIntervalRef.current);
+        }
+
+        if (dagState?.dagId) {
+            pollingIntervalRef.current = setInterval(async () => {
+                try {
+                    const response = await fetch(`${apiUrl}/${dagState.dagId}`);
+                    if (response.ok) {
+                        const data = await response.json();
+                        setDagState(data); // Update the UI with the new state from the backend
+                    } else {
+                        // Stop polling if the DAG is not found (e.g., expired from Redis)
+                        clearInterval(pollingIntervalRef.current);
+                    }
+                } catch (e) {
+                    console.error("Polling error:", e);
+                    clearInterval(pollingIntervalRef.current);
+                }
+            }, 2000); // Poll for new status every 2 seconds
+        }
+
+        // Cleanup function: This is called when the component is unmounted
+        // to prevent memory leaks from the interval.
+        return () => {
+            if (pollingIntervalRef.current) {
+                clearInterval(pollingIntervalRef.current);
+            }
+        };
+    }, [dagState?.dagId]);
+
 
     const handleSubmit = async () => {
-        setResponse(null);
+        setIsSubmitting(true);
         setError('');
-        if (!yamlText.trim()) {
-            setError("Cannot submit an empty DAG.");
-            return;
-        }
+        setDagState(null); // Clear any previous DAG run from the display
+
         try {
             const dagObject = jsyaml.load(yamlText);
-            // When running in Docker, we'll call the backend by its service name.
-            // For local dev, it's localhost:8080. We can detect this.
-            const apiUrl = process.env.NODE_ENV === 'production'
-                ? '/api/v1/dags' // In production (Docker), this will be proxied
-                : 'http://localhost:8080/api/v1/dags';
-
             const apiResponse = await fetch(apiUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -41,103 +125,67 @@ const DagSubmitter = () => {
             });
             if (!apiResponse.ok) throw new Error(`Server Error: ${apiResponse.status}`);
             const result = await apiResponse.json();
-            setResponse(result);
+
+            // Set the initial state of the dashboard to kick off the polling.
+            const initialTasks = dagObject.tasks.map(t => ({
+                name: t.name,
+                status: 'PENDING',
+                dependsOn: t.depends_on || [],
+                logs: []
+            }));
+            setDagState({ dagId: result.dagId, dagName: dagObject.dagName, tasks: initialTasks });
+
         } catch (err) {
             setError(err.message);
+        } finally {
+            setIsSubmitting(false);
         }
-    };
-
-    const handleFileRead = (file) => {
-        const reader = new FileReader();
-        reader.onload = (e) => setYamlText(e.target.result);
-        reader.onerror = (e) => setError("Failed to read file.");
-        reader.readAsText(file);
-    };
-
-    const handleFileChange = (e) => handleFileRead(e.target.files[0]);
-    const handleDrop = (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        setIsDragging(false);
-        if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-            handleFileRead(e.dataTransfer.files[0]);
-            setActiveTab('editor');
-        }
-    };
-    
-    const dragProps = {
-        onDragEnter: (e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(true); },
-        onDragLeave: (e) => { e.preventDefault(); e.stopPropagation(); setIsDragging(false); },
-        onDragOver: (e) => { e.preventDefault(); e.stopPropagation(); },
-        onDrop: handleDrop,
     };
 
     return (
-        <div style={styles.container} {...dragProps}>
+        <div style={styles.container}>
             <div style={styles.panel}>
-                <h1 style={styles.title}>DAG Submission Terminal</h1>
-                <div style={styles.tabs}>
-                    <button onClick={() => setActiveTab('editor')} style={activeTab === 'editor' ? styles.tabActive : styles.tab}>
-                        <Edit3 size={16} /> Editor
-                    </button>
-                    <button onClick={() => setActiveTab('upload')} style={activeTab === 'upload' ? styles.tabActive : styles.tab}>
-                        <Upload size={16} /> Upload
-                    </button>
-                    <button onClick={() => setActiveTab('drag')} style={activeTab === 'drag' ? styles.tabActive : styles.tab}>
-                        <FileText size={16} /> Drag & Drop
-                    </button>
+                <h1 style={styles.title}>DAG Orchestration Terminal</h1>
+                <div style={styles.editorContainer}>
+                    <textarea style={styles.textArea} value={yamlText} onChange={(e) => setYamlText(e.target.value)} />
                 </div>
-
-                <div style={styles.content}>
-                    {activeTab === 'editor' && <textarea style={styles.textArea} value={yamlText} onChange={(e) => setYamlText(e.target.value)} />}
-                    {activeTab === 'upload' && (
-                        <div style={styles.uploadBox} onClick={() => fileInputRef.current.click()}>
-                            <Upload size={48} color="#00f5ff" />
-                            <p>Click to select a .yml file</p>
-                            <input type="file" ref={fileInputRef} onChange={handleFileChange} accept=".yml,.yaml" style={{ display: 'none' }} />
-                        </div>
-                    )}
-                    {activeTab === 'drag' && (
-                        <div style={{...styles.uploadBox, ...(isDragging ? styles.dragOver : {})}}>
-                            <FileText size={48} color="#00f5ff" />
-                            <p>Drop your .yml file here</p>
-                        </div>
-                    )}
-                </div>
-
-                <button style={styles.submitButton} onClick={handleSubmit}>Initiate Workflow</button>
-
-                {response && (
-                    <div style={styles.responseBox}>
-                        <h3 style={{color: '#00ff8c'}}>Transmission Successful</h3>
-                        <pre>{JSON.stringify(response, null, 2)}</pre>
-                    </div>
-                )}
-                {error && (
-                    <div style={{...styles.responseBox, borderColor: '#ff4d4d'}}>
-                        <h3 style={{color: '#ff4d4d'}}>Transmission Error</h3>
-                        <pre>{error}</pre>
-                    </div>
-                )}
+                <button style={styles.submitButton} onClick={handleSubmit} disabled={isSubmitting}>
+                    {isSubmitting ? 'Submitting...' : 'Initiate Workflow'}
+                </button>
+                {error && <div style={styles.errorBox}>{error}</div>}
             </div>
+
+            {/* This entire section is new. It only renders after a DAG has been submitted. */}
+            {dagState && (
+                 <div style={{...styles.panel, marginTop: '20px'}}>
+                     <h2 style={styles.title}>Live DAG Run: {dagState.dagName}</h2>
+                     <p style={styles.dagId}>DAG Run ID: {dagState.dagId}</p>
+                     <div style={styles.taskList}>
+                         {dagState.tasks.map(task => <TaskItem key={task.name} task={task} />)}
+                     </div>
+                 </div>
+            )}
         </div>
     );
 };
 
-// CSS-in-JS for a futuristic look
+// Updated styles for the new dashboard layout
 const styles = {
-    container: { minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px' },
-    panel: { width: '100%', maxWidth: '800px', backgroundColor: '#101827', border: '1px solid #00f5ff', borderRadius: '8px', padding: '30px', boxShadow: '0 0 25px rgba(0, 245, 255, 0.3)' },
-    title: { color: '#00f5ff', textAlign: 'center', margin: '0 0 30px 0' },
-    tabs: { display: 'flex', borderBottom: '1px solid #334155', marginBottom: '20px' },
-    tab: { background: 'none', border: 'none', color: '#94a3b8', padding: '10px 20px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '8px' },
-    tabActive: { background: 'none', border: 'none', color: '#00f5ff', padding: '10px 20px', cursor: 'pointer', borderBottom: '2px solid #00f5ff', display: 'flex', alignItems: 'center', gap: '8px' },
-    content: { minHeight: '300px' },
-    textArea: { width: '100%', height: '300px', backgroundColor: '#0a0f18', border: '1px solid #334155', color: '#e0e0e0', borderRadius: '4px', padding: '15px', fontFamily: 'monospace', fontSize: '14px', boxSizing: 'border-box' },
-    uploadBox: { width: '100%', height: '300px', border: '2px dashed #334155', borderRadius: '4px', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#94a3b8', boxSizing: 'border-box' },
-    dragOver: { borderColor: '#00f5ff', animation: 'glow 1.5s infinite alternate' },
-    submitButton: { width: '100%', background: '#00f5ff', border: 'none', color: '#0a0f18', padding: '15px', borderRadius: '4px', fontSize: '18px', fontWeight: 'bold', cursor: 'pointer', marginTop: '20px' },
-    responseBox: { marginTop: '20px', padding: '15px', backgroundColor: '#101827', border: '1px solid #00ff8c', borderRadius: '4px', whiteSpace: 'pre-wrap', fontFamily: 'monospace' },
+    container: { width: '90%', margin: '0 auto', fontFamily: 'Arial, sans-serif', padding: '20px 0' },
+    panel: { width: '100%', maxWidth: '900px', backgroundColor: '#101827', border: '1px solid #00f5ff', borderRadius: '8px', padding: '30px', boxShadow: '0 0 25px rgba(0, 245, 255, 0.3)', margin: '0 auto' },
+    title: { color: '#00f5ff', textAlign: 'center', margin: '0 0 20px 0' },
+    editorContainer: { marginBottom: '20px' },
+    textArea: { width: '100%', height: '350px', backgroundColor: '#0a0f18', border: '1px solid #334155', color: '#e0e0e0', borderRadius: '4px', padding: '15px', fontFamily: 'monospace', fontSize: '14px', boxSizing: 'border-box' },
+    submitButton: { width: '100%', background: '#00f5ff', border: 'none', color: '#0a0f18', padding: '15px', borderRadius: '4px', fontSize: '18px', fontWeight: 'bold', cursor: 'pointer', transition: 'opacity 0.2s' },
+    errorBox: { marginTop: '15px', padding: '10px', backgroundColor: '#ff4d4d20', border: '1px solid #ff4d4d', color: 'white', borderRadius: '4px', fontFamily: 'monospace' },
+    dagId: { color: '#94a3b8', textAlign: 'center', marginBottom: '20px', wordBreak: 'break-all', fontSize: '14px' },
+    taskList: { display: 'flex', flexDirection: 'column', gap: '10px' },
+    taskItem: { backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px', padding: '15px', transition: 'all 0.3s' },
+    taskHeader: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' },
+    taskName: { color: 'white', fontWeight: 'bold', flexGrow: 1 },
+    taskStatus: { fontStyle: 'italic', color: '#e0e0e0' },
+    dependencies: { display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontSize: '12px', marginBottom: '10px', paddingLeft: '5px' },
+    logs: { backgroundColor: '#0a0f18', padding: '10px', borderRadius: '4px', fontFamily: 'monospace', fontSize: '12px', color: '#e0e0e0', whiteSpace: 'pre-wrap', maxHeight: '150px', overflowY: 'auto', border: '1px solid #334155' },
 };
 
-export default DagSubmitter;
+export default DagMonitor;
