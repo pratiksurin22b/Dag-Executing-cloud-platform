@@ -1,7 +1,9 @@
 package com.example.demo.service;
+
+import com.example.demo.config.RabbitMQConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.example.demo.config.RabbitMQConfig;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -9,7 +11,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.util.UUID;
+import java.util.stream.StreamSupport;
 
 @Service
 public class OrchestratorService {
@@ -28,46 +32,79 @@ public class OrchestratorService {
 
     public String processNewDagSubmission(JsonNode dagPayload) {
         String dagId = "dag-" + UUID.randomUUID();
-        LOGGER.info("Processing new DAG submission. Assigned DAG ID: {}", dagId);
-
         try {
-            // Step 1: Save the entire DAG definition and initial status to Redis
+            // Save the blueprint and the initial PENDING status for all tasks
             redisTemplate.opsForValue().set("dag:" + dagId + ":definition", dagPayload.toString());
-            redisTemplate.opsForValue().set("dag:" + dagId + ":status", "PENDING");
-
-            // Step 2: Save the initial state for each task
             dagPayload.get("tasks").forEach(taskNode -> {
                 String taskName = taskNode.get("name").asText();
                 redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "PENDING");
             });
-
-            // Step 3: Find and queue the initial runnable tasks
-            findAndQueueRunnableTasks(dagId, dagPayload);
-
+            // Immediately evaluate the DAG to run the first tasks
+            evaluateDag(dagId);
         } catch (Exception e) {
-            LOGGER.error("Failed to process DAG submission for DAG ID: {}", dagId, e);
-            // In a real app, you would handle this error more gracefully
+            LOGGER.error("Failed to process DAG submission", e);
             return null;
         }
-
         return dagId;
     }
 
-    private void findAndQueueRunnableTasks(String dagId, JsonNode dagPayload) {
-        dagPayload.get("tasks").forEach(taskNode -> {
-            String taskName = taskNode.get("name").asText();
-
-            // A task is runnable if it has no dependencies
-            if (!taskNode.has("depends_on") || taskNode.get("depends_on").isEmpty()) {
-                LOGGER.info("Found initial runnable task '{}' for DAG ID: {}", taskName, dagId);
-
-                // Update status in Redis to QUEUED
-                redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "QUEUED");
-
-                // Publish the task to RabbitMQ
-                rabbitTemplate.convertAndSend(RabbitMQConfig.COMMAND_TASK_QUEUE, taskNode.toString());
-                LOGGER.info("Task '{}' has been sent to the message queue.", taskName);
+    // The core logic engine for the DAG
+    public void evaluateDag(String dagId) {
+        try {
+            String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
+            if (dagJson == null) {
+                LOGGER.error("Cannot evaluate DAG. Definition for DAG ID '{}' not found in Redis.", dagId);
+                return;
             }
-        });
+            JsonNode dagPayload = objectMapper.readTree(dagJson);
+
+            dagPayload.get("tasks").forEach(taskNode -> {
+                String taskName = taskNode.get("name").asText();
+                String currentStatus = redisTemplate.opsForValue().get("dag:" + dagId + ":task:" + taskName + ":status");
+
+                // We only care about tasks that are waiting to be run
+                if ("PENDING".equals(currentStatus)) {
+                    // Check if all dependencies for this task are met
+                    if (areDependenciesMet(dagId, taskNode)) {
+                        dispatchTask(dagId, taskNode);
+                    }
+                }
+            });
+        } catch (IOException e) {
+            LOGGER.error("Failed to read or parse DAG definition for evaluation for DAG ID: {}", dagId, e);
+        }
+    }
+
+    private boolean areDependenciesMet(String dagId, JsonNode taskNode) {
+        if (!taskNode.has("depends_on") || taskNode.get("depends_on").isEmpty()) {
+            return true; // No dependencies, so they are always met.
+        }
+        // This is the key logic: check the status of every dependency in Redis.
+        return StreamSupport.stream(taskNode.get("depends_on").spliterator(), false)
+                .allMatch(dependencyNode -> {
+                    String dependencyName = dependencyNode.asText();
+                    String dependencyStatus = redisTemplate.opsForValue().get("dag:" + dagId + ":task:" + dependencyName + ":status");
+                    return "SUCCEEDED".equals(dependencyStatus);
+                });
+    }
+
+    private void dispatchTask(String dagId, JsonNode taskNode) {
+        String taskName = taskNode.get("name").asText();
+        try {
+            // Update status to QUEUED before sending to prevent duplicate dispatches
+            redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "QUEUED");
+
+            // Add the dagId to the message payload so the worker can report back
+            ObjectNode messagePayload = (ObjectNode) taskNode.deepCopy();
+            messagePayload.put("dagId", dagId);
+
+            String message = objectMapper.writeValueAsString(messagePayload);
+            rabbitTemplate.convertAndSend(RabbitMQConfig.COMMAND_TASK_QUEUE, message);
+            LOGGER.info("Dispatched task '{}' for DAG ID '{}' to the queue.", taskName, dagId);
+        } catch (Exception e) {
+            LOGGER.error("Failed to dispatch task '{}' for DAG ID '{}'", taskName, dagId, e);
+            // If dispatch fails, roll back the status to PENDING so we can try again later
+            redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "PENDING");
+        }
     }
 }

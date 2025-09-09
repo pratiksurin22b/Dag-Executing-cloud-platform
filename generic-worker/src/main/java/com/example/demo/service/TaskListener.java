@@ -1,8 +1,9 @@
 package com.example.demo.service;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
+import com.example.demo.config.RabbitMQConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.model.Frame;
@@ -11,12 +12,15 @@ import com.github.dockerjava.core.DockerClientImpl;
 import com.github.dockerjava.core.command.LogContainerResultCallback;
 import com.github.dockerjava.httpclient5.ApacheDockerHttpClient;
 import com.github.dockerjava.transport.DockerHttpClient;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 @Service
@@ -24,8 +28,11 @@ public class TaskListener {
     private static final Logger LOGGER = LoggerFactory.getLogger(TaskListener.class);
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final DockerClient dockerClient;
+    private final RabbitTemplate rabbitTemplate; // NEW: For sending result messages
 
-    public TaskListener() {
+    @Autowired // NEW: Spring will inject the RabbitTemplate for us
+    public TaskListener(RabbitTemplate rabbitTemplate) {
+        this.rabbitTemplate = rabbitTemplate;
         LOGGER.info("Initializing TaskListener...");
         DefaultDockerClientConfig config = DefaultDockerClientConfig.createDefaultConfigBuilder().build();
         DockerHttpClient httpClient = new ApacheDockerHttpClient.Builder()
@@ -33,109 +40,106 @@ public class TaskListener {
                 .sslConfig(config.getSSLConfig())
                 .build();
         this.dockerClient = DockerClientImpl.getInstance(config, httpClient);
-        LOGGER.info("Docker client initialized successfully using Apache HttpClient5 transport.");
+        LOGGER.info("Docker client initialized successfully.");
     }
 
-    @RabbitListener(queues = "command_tasks_queue")
+    @RabbitListener(queues = RabbitMQConfig.COMMAND_TASK_QUEUE)
     public void receiveTask(String taskMessage) {
         LOGGER.info("====== TASK PROCESSING STARTED ======");
-        LOGGER.debug("Received raw message from queue: {}", taskMessage);
-
+        JsonNode taskNode = null;
         String containerId = null;
+        int exitCode = -1; // Default to a failure code
+        List<String> logs = new ArrayList<>();
+
         try {
-            // Step 1: Parse the incoming message
-            JsonNode taskNode = parseTaskMessage(taskMessage);
+            // Unpack the work order
+            taskNode = objectMapper.readTree(taskMessage);
             String taskName = taskNode.get("name").asText();
             String image = taskNode.get("image").asText();
             String[] command = objectMapper.convertValue(taskNode.get("command"), String[].class);
-            LOGGER.info("Successfully parsed task '{}'. Image: [{}], Command: [{}]", taskName, image, String.join(" ", command));
 
-            // NEW STEP: Pull the Docker image to ensure it exists locally
+            // Ensure the necessary Docker image is available
             pullImage(image);
 
-            // Step 2: Create the Docker container
-            LOGGER.info("Task '{}': Attempting to create container...", taskName);
-            CreateContainerResponse container = dockerClient.createContainerCmd(image)
-                    .withCmd(command)
-                    .exec();
+            // Create the container
+            CreateContainerResponse container = dockerClient.createContainerCmd(image).withCmd(command).exec();
             containerId = container.getId();
-            LOGGER.info("Task '{}': Container created successfully with ID: {}", taskName, containerId);
 
             // This nested try-finally ensures the container is always removed
             try {
-                // Step 3: Start the container
-                LOGGER.info("Task '{}': Starting container...", taskName);
+                // Execute the task
                 dockerClient.startContainerCmd(containerId).exec();
-                LOGGER.info("Task '{}': Container started.", taskName);
-
-                // Step 4: Wait for the container to complete
-                LOGGER.info("Task '{}': Waiting for container to finish execution...", taskName);
-                int exitCode = dockerClient.waitContainerCmd(containerId).start().awaitStatusCode();
-                LOGGER.info("Task '{}': Container finished with Exit Code: {}", taskName, exitCode);
-
-                // Step 5: Capture the logs
-                logContainerOutput(taskName, containerId);
-
+                exitCode = dockerClient.waitContainerCmd(containerId).start().awaitStatusCode();
+                // Capture the results (the logs)
+                logs = captureLogs(containerId);
             } finally {
-                // Step 6: Guaranteed Cleanup
-                LOGGER.info("Task '{}': Initiating cleanup. Removing container...", taskName);
                 dockerClient.removeContainerCmd(containerId).exec();
-                LOGGER.info("Task '{}': Container removed successfully.", taskName);
             }
 
-        } catch (JsonProcessingException e) {
-            LOGGER.error("CRITICAL: Failed to parse JSON message from queue. The message is malformed. Message: '{}'", taskMessage, e);
         } catch (Exception e) {
-            LOGGER.error("CRITICAL: An unexpected error occurred during task processing. Container ID (if created): {}", containerId, e);
-            // Emergency cleanup
-            if (containerId != null) {
-                try {
-                    LOGGER.warn("Attempting emergency cleanup of container {}", containerId);
-                    dockerClient.removeContainerCmd(containerId).withForce(true).exec();
-                    LOGGER.warn("Emergency cleanup successful for container {}", containerId);
-                } catch (Exception cleanupException) {
-                    LOGGER.error("CRITICAL: Failed to perform emergency cleanup for container {}. Manual intervention may be required.", containerId, cleanupException);
-                }
-            }
+            LOGGER.error("CRITICAL: An unexpected error occurred during task processing.", e);
+            exitCode = -1; // Ensure the exit code reflects failure
+            logs.add("Worker-level exception: " + e.getMessage());
         } finally {
+            // This block is GUARANTEED to run, ensuring we always report a result back.
+            // This is the core of the feedback loop.
+            if (taskNode != null) {
+                reportResult(taskNode, exitCode, logs);
+            }
             LOGGER.info("====== TASK PROCESSING FINISHED ======");
         }
     }
 
-    private JsonNode parseTaskMessage(String message) throws JsonProcessingException {
-        if (message == null || message.trim().isEmpty()) {
-            throw new IllegalArgumentException("Received an empty or null task message from the queue.");
+    /**
+     * Constructs a result message and sends it to the central results queue.
+     */
+    private void reportResult(JsonNode taskNode, int exitCode, List<String> logs) {
+        try {
+            // Create the JSON payload for the result message
+            ObjectNode result = objectMapper.createObjectNode();
+            result.put("dagId", taskNode.get("dagId").asText());
+            result.put("taskName", taskNode.get("name").asText());
+            result.put("status", exitCode == 0 ? "SUCCEEDED" : "FAILED");
+            result.set("logs", objectMapper.valueToTree(logs));
+
+            String resultMessage = objectMapper.writeValueAsString(result);
+
+            // Send the message to the dedicated results queue
+            rabbitTemplate.convertAndSend(RabbitMQConfig.TASK_RESULTS_QUEUE, resultMessage);
+            LOGGER.info("Reported final status '{}' for task '{}' to the results queue.", result.get("status").asText(), result.get("taskName").asText());
+        } catch (Exception e) {
+            LOGGER.error("CRITICAL: Could not report task result back to the scheduler. This could cause the DAG to stall.", e);
         }
-        return objectMapper.readTree(message);
     }
 
+    /**
+     * Captures stdout and stderr from a completed container.
+     * @return A List containing all log lines.
+     */
+    private List<String> captureLogs(String containerId) throws InterruptedException {
+        final List<String> logs = new ArrayList<>();
+        LogContainerResultCallback loggingCallback = new LogContainerResultCallback() {
+            @Override
+            public void onNext(Frame item) {
+                logs.add(new String(item.getPayload()).trim());
+            }
+        };
+        dockerClient.logContainerCmd(containerId).withStdOut(true).withStdErr(true).exec(loggingCallback).awaitCompletion();
+        return logs;
+    }
+
+    /**
+     * Ensures a Docker image is available locally, pulling it if necessary.
+     */
     private void pullImage(String image) throws InterruptedException {
         LOGGER.info("Checking for image '{}' locally...", image);
         try {
             dockerClient.inspectImageCmd(image).exec();
-            LOGGER.info("Image '{}' already exists locally. No pull needed.", image);
+            LOGGER.info("Image '{}' already exists locally.", image);
         } catch (com.github.dockerjava.api.exception.NotFoundException e) {
             LOGGER.warn("Image '{}' not found locally. Pulling from registry...", image);
-            // This will pull the image from Docker Hub. It can take some time.
             dockerClient.pullImageCmd(image).start().awaitCompletion(5, TimeUnit.MINUTES);
             LOGGER.info("Successfully pulled image '{}'.", image);
         }
-    }
-
-    private void logContainerOutput(String taskName, String containerId) throws InterruptedException {
-        LOGGER.info("Task '{}': Fetching logs from container...", taskName);
-        final LogContainerResultCallback loggingCallback = new LogContainerResultCallback() {
-            @Override
-            public void onNext(Frame item) {
-                LOGGER.info("[Task: {}] [Container Log] > {}", taskName, new String(item.getPayload()).trim());
-            }
-        };
-
-        dockerClient.logContainerCmd(containerId)
-                .withStdOut(true)
-                .withStdErr(true)
-                .exec(loggingCallback)
-                .awaitCompletion();
-        LOGGER.info("Task '{}': Finished fetching logs.", taskName);
     }
 }
