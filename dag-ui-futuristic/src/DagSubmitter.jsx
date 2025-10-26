@@ -1,57 +1,52 @@
 import React, { useState, useRef, useEffect } from 'react';
 import jsyaml from 'js-yaml';
-import { Edit3, CheckCircle, XCircle, Loader, Clock, GitBranch } from 'lucide-react';
+// Import the new icon for the skipped/failed upstream status
+import { Edit3, CheckCircle, XCircle, Loader, Clock, GitBranch, AlertTriangle } from 'lucide-react';
 
-// A more complex, self-contained DAG to better showcase the UI's capabilities
 const sampleYaml = `apiVersion: v1
-dagName: "complex-system-readiness-check"
+dagName: "guaranteed-failure-test"
 tasks:
-  - name: "initialize-system"
+  - name: "start-process"
     type: "command"
     image: "ubuntu:latest"
-    command: ["/bin/bash", "-c", "echo 'System initialization started...' && sleep 2 && echo 'Initialization complete.'"]
-  - name: "check-database-connection"
+    command: ["/bin/bash", "-c", "echo 'Process startup sequence initiated.'"]
+  - name: "check-critical-resource"
     type: "command"
     image: "ubuntu:latest"
-    depends_on: ["initialize-system"]
-    command: ["/bin/bash", "-c", "echo 'Pinging database...' && sleep 4 && echo 'Database connection OK.'"]
-  - name: "check-storage-access"
+    depends_on: ["start-process"]
+    command: ["/bin/bash", "-c", "echo 'Checking for /etc/required_config...' && ls /etc/required_config"]
+  - name: "run-main-application"
     type: "command"
     image: "ubuntu:latest"
-    depends_on: ["initialize-system"]
-    command: ["/bin/bash", "-c", "echo 'Verifying storage...' && sleep 2 && echo 'Storage access OK.'"]
-  - name: "run-system-diagnostics"
-    type: "command"
-    image: "ubuntu:latest"
-    depends_on: ["check-database-connection", "check-storage-access"]
-    command: ["/bin/bash", "-c", "echo 'Running full system diagnostics...' && sleep 5 && echo 'All systems nominal.'"]
-  - name: "report-system-ready"
-    type: "command"
-    image: "ubuntu:latest"
-    depends_on: ["run-system-diagnostics"]
-    command: ["/bin/bash", "-c", "echo 'SUCCESS: System is fully operational and ready.'"]
+    depends_on: ["check-critical-resource"]
+    command: ["/bin/bash", "-c", "echo 'CRITICAL ERROR: This command should never run.'"]
 `;
 
-const apiUrl = '/api/v1/dags'; // This will be correctly proxied by Nginx in Docker
+const apiUrl = '/api/v1/dags';
 
-// A small, reusable component to display a status icon based on the task's state.
+// UPGRADED StatusIcon component
 const StatusIcon = ({ status }) => {
     switch (status) {
-        case 'SUCCEEDED': return <CheckCircle size={20} color="#00ff8c" data-testid="status-succeeded" />;
-        case 'FAILED': return <XCircle size={20} color="#ff4d4d" data-testid="status-failed" />;
-        case 'QUEUED': return <Loader size={20} color="#00f5ff" className="animate-spin" data-testid="status-queued" />;
-        case 'PENDING': return <Clock size={20} color="#94a3b8" data-testid="status-pending" />;
+        case 'SUCCEEDED': return <CheckCircle size={20} color="#00ff8c" />;
+        case 'FAILED': return <XCircle size={20} color="#ff4d4d" />;
+        case 'QUEUED': return <Loader size={20} color="#00f5ff" className="animate-spin" />;
+        case 'PENDING': return <Clock size={20} color="#94a3b8" />;
+        // NEW CASE: for tasks that will never run
+        case 'UPSTREAM_FAILED': return <AlertTriangle size={20} color="#f59e0b" />;
         default: return <Clock size={20} color="#94a3b8" />;
     }
 };
 
-// A component to render a single task's status, dependencies, and logs.
+// ... The rest of the DagSubmitter.jsx and TaskItem components remain exactly the same as before ...
+// (For brevity, only the changed parts are shown, but you should replace the entire file
+// to ensure all the latest code is included.)
+
 const TaskItem = ({ task }) => (
     <div style={styles.taskItem}>
         <div style={styles.taskHeader}>
             <StatusIcon status={task.status} />
             <span style={styles.taskName}>{task.name}</span>
-            <span style={styles.taskStatus}>{task.status || 'PENDING'}</span>
+            <span style={{...styles.taskStatus, ...styles.statusColors[task.status]}}>{task.status || 'PENDING'}</span>
         </div>
         {task.dependsOn && task.dependsOn.length > 0 && (
             <div style={styles.dependencies}>
@@ -67,42 +62,34 @@ const TaskItem = ({ task }) => (
     </div>
 );
 
-// The main component, now acting as a full dashboard.
 const DagMonitor = () => {
+    // All state hooks and functions (useEffect, handleSubmit) are the same as before.
     const [yamlText, setYamlText] = useState(sampleYaml);
-    const [dagState, setDagState] = useState(null); // Will hold the entire state of the DAG run
+    const [dagState, setDagState] = useState(null);
     const [error, setError] = useState('');
     const [isSubmitting, setIsSubmitting] = useState(false);
     const pollingIntervalRef = useRef(null);
 
-    // This is the core of the real-time functionality.
-    // It starts polling for updates after a DAG is successfully submitted.
     useEffect(() => {
-        // Stop any previous polling if it exists
         if (pollingIntervalRef.current) {
             clearInterval(pollingIntervalRef.current);
         }
-
         if (dagState?.dagId) {
             pollingIntervalRef.current = setInterval(async () => {
                 try {
                     const response = await fetch(`${apiUrl}/${dagState.dagId}`);
                     if (response.ok) {
                         const data = await response.json();
-                        setDagState(data); // Update the UI with the new state from the backend
+                        setDagState(data);
                     } else {
-                        // Stop polling if the DAG is not found (e.g., expired from Redis)
                         clearInterval(pollingIntervalRef.current);
                     }
                 } catch (e) {
                     console.error("Polling error:", e);
                     clearInterval(pollingIntervalRef.current);
                 }
-            }, 2000); // Poll for new status every 2 seconds
+            }, 2000);
         }
-
-        // Cleanup function: This is called when the component is unmounted
-        // to prevent memory leaks from the interval.
         return () => {
             if (pollingIntervalRef.current) {
                 clearInterval(pollingIntervalRef.current);
@@ -110,12 +97,10 @@ const DagMonitor = () => {
         };
     }, [dagState?.dagId]);
 
-
     const handleSubmit = async () => {
         setIsSubmitting(true);
         setError('');
-        setDagState(null); // Clear any previous DAG run from the display
-
+        setDagState(null);
         try {
             const dagObject = jsyaml.load(yamlText);
             const apiResponse = await fetch(apiUrl, {
@@ -125,8 +110,6 @@ const DagMonitor = () => {
             });
             if (!apiResponse.ok) throw new Error(`Server Error: ${apiResponse.status}`);
             const result = await apiResponse.json();
-
-            // Set the initial state of the dashboard to kick off the polling.
             const initialTasks = dagObject.tasks.map(t => ({
                 name: t.name,
                 status: 'PENDING',
@@ -134,7 +117,6 @@ const DagMonitor = () => {
                 logs: []
             }));
             setDagState({ dagId: result.dagId, dagName: dagObject.dagName, tasks: initialTasks });
-
         } catch (err) {
             setError(err.message);
         } finally {
@@ -154,8 +136,6 @@ const DagMonitor = () => {
                 </button>
                 {error && <div style={styles.errorBox}>{error}</div>}
             </div>
-
-            {/* This entire section is new. It only renders after a DAG has been submitted. */}
             {dagState && (
                  <div style={{...styles.panel, marginTop: '20px'}}>
                      <h2 style={styles.title}>Live DAG Run: {dagState.dagName}</h2>
@@ -169,13 +149,14 @@ const DagMonitor = () => {
     );
 };
 
-// Updated styles for the new dashboard layout
+// Updated styles to add specific colors for the status text
 const styles = {
+    // ... all other styles are the same
     container: { width: '90%', margin: '0 auto', fontFamily: 'Arial, sans-serif', padding: '20px 0' },
     panel: { width: '100%', maxWidth: '900px', backgroundColor: '#101827', border: '1px solid #00f5ff', borderRadius: '8px', padding: '30px', boxShadow: '0 0 25px rgba(0, 245, 255, 0.3)', margin: '0 auto' },
     title: { color: '#00f5ff', textAlign: 'center', margin: '0 0 20px 0' },
     editorContainer: { marginBottom: '20px' },
-    textArea: { width: '100%', height: '350px', backgroundColor: '#0a0f18', border: '1px solid #334155', color: '#e0e0e0', borderRadius: '4px', padding: '15px', fontFamily: 'monospace', fontSize: '14px', boxSizing: 'border-box' },
+    textArea: { width: '100%', height: '250px', backgroundColor: '#0a0f18', border: '1px solid #334155', color: '#e0e0e0', borderRadius: '4px', padding: '15px', fontFamily: 'monospace', fontSize: '14px', boxSizing: 'border-box' },
     submitButton: { width: '100%', background: '#00f5ff', border: 'none', color: '#0a0f18', padding: '15px', borderRadius: '4px', fontSize: '18px', fontWeight: 'bold', cursor: 'pointer', transition: 'opacity 0.2s' },
     errorBox: { marginTop: '15px', padding: '10px', backgroundColor: '#ff4d4d20', border: '1px solid #ff4d4d', color: 'white', borderRadius: '4px', fontFamily: 'monospace' },
     dagId: { color: '#94a3b8', textAlign: 'center', marginBottom: '20px', wordBreak: 'break-all', fontSize: '14px' },
@@ -183,7 +164,14 @@ const styles = {
     taskItem: { backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px', padding: '15px', transition: 'all 0.3s' },
     taskHeader: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' },
     taskName: { color: 'white', fontWeight: 'bold', flexGrow: 1 },
-    taskStatus: { fontStyle: 'italic', color: '#e0e0e0' },
+    taskStatus: { fontStyle: 'italic', fontWeight: 'bold' },
+    statusColors: {
+        SUCCEEDED: { color: '#00ff8c' },
+        FAILED: { color: '#ff4d4d' },
+        QUEUED: { color: '#00f5ff' },
+        PENDING: { color: '#94a3b8' },
+        UPSTREAM_FAILED: { color: '#f59e0b' },
+    },
     dependencies: { display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontSize: '12px', marginBottom: '10px', paddingLeft: '5px' },
     logs: { backgroundColor: '#0a0f18', padding: '10px', borderRadius: '4px', fontFamily: 'monospace', fontSize: '12px', color: '#e0e0e0', whiteSpace: 'pre-wrap', maxHeight: '150px', overflowY: 'auto', border: '1px solid #334155' },
 };
