@@ -1,0 +1,49 @@
+# 02-rabbitmq.yaml
+# Deploys RabbitMQ using a StatefulSet and exposes it via a Service.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: helios
+spec:
+  serviceName: "rabbitmq"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3.13-management-alpine # Includes the management UI
+          ports:
+            - containerPort: 5672
+              name: amqp # Port for application connections
+            - containerPort: 15672
+              name: management # Port for the web UI
+          env:
+            # Default credentials for development
+            - name: RABBITMQ_DEFAULT_USER
+              value: "guest"
+            - name: RABBITMQ_DEFAULT_PASS
+              value: "guest"
+          # Note: Production would require persistent volumes and potentially clustering.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq # Service name used for DNS (rabbitmq.helios.svc.cluster.local)
+  namespace: helios
+spec:
+  ports:
+    - port: 5672
+      targetPort: amqp
+      name: amqp
+    - port: 15672
+      targetPort: management
+      name: management # Allows accessing the UI (via port-forward or Ingress later)
+  selector:
+    app: rabbitmq

@@ -1,0 +1,42 @@
+# 04-04-frontend.yaml
+# Deploys the React frontend served by Nginx and exposes it externally.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: helios
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          # --- IMPORTANT: Replace with your actual image name and tag ---
+          image: pratik9634/frontend:k8s-v1.0
+          # --- ---
+          # imagePullPolicy: IfNotPresent # If using local images
+          ports:
+            - containerPort: 80 # Nginx listens on port 80
+          # Nginx config inside the image proxies /api requests to scheduler-service:8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend # Service name
+  namespace: helios
+spec:
+  ports:
+    - port: 80 # External port clients will connect to
+      targetPort: 80 # Port the container listens on
+      protocol: TCP
+  selector:
+    app: frontend
+  # LoadBalancer type automatically works with Docker Desktop to expose on localhost:80
+  # In cloud environments, it provisions a cloud load balancer.
+  type: LoadBalancer

@@ -1,0 +1,6 @@
+# 00-namespace.yaml
+# Creates a dedicated namespace for the Helios application components.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: helios

@@ -1,0 +1,40 @@
+# 01-redis.yaml
+# Deploys Redis using a StatefulSet for stable identity and a Service for discovery.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: helios
+spec:
+  serviceName: "redis" # The governing service name
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine # Using a stable Redis image
+          ports:
+            - containerPort: 6379
+              name: redis-port # Renamed for clarity
+          # Note: Persistence (PersistentVolumeClaim) is not included here for simplicity,
+          # but would be essential for production to prevent data loss on Pod restarts.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis # Service name used for DNS (redis.helios.svc.cluster.local)
+  namespace: helios
+spec:
+  ports:
+    - port: 6379
+      targetPort: redis-port # Match the container port name
+      name: redis
+  selector:
+    app: redis # Selects the Pods managed by the StatefulSet
+  # ClusterIP is default and suitable for internal services like Redis

@@ -1,0 +1,48 @@
+# 03-scheduler-service.yaml
+# Deploys the main Helios scheduler application.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler-service
+  namespace: helios
+spec:
+  replicas: 1 # Start with one instance
+  selector:
+    matchLabels:
+      app: scheduler-service
+  template:
+    metadata:
+      labels:
+        app: scheduler-service
+    spec:
+      # Associate with the Service Account that has permissions to manage Jobs
+      serviceAccountName: helios-scheduler-sa
+      containers:
+        - name: scheduler-service
+          # --- IMPORTANT: Replace with your actual image name and tag ---
+          image: pratik9634/scheduler-service:k8s-v1.2
+          # --- ---
+          # Recommended: Change pull policy if using local dev images without pushing
+          # imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            # Use Kubernetes internal DNS names to find other services
+            - name: SPRING_RABBITMQ_HOST
+              value: "rabbitmq.helios.svc.cluster.local" # service-name.namespace.svc.cluster.local
+            - name: SPRING_DATA_REDIS_HOST
+              value: "redis.helios.svc.cluster.local"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scheduler-service # Internal DNS name for the scheduler
+  namespace: helios
+spec:
+  ports:
+    - port: 8080 # Port the service listens on internally
+      targetPort: 8080 # Port the container exposes
+  selector:
+    app: scheduler-service
+  # ClusterIP makes it reachable only within the Kubernetes cluster (e.g., by the frontend proxy)
+  type: ClusterIP
