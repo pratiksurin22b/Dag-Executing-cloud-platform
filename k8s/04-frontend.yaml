@@ -14,21 +14,33 @@ spec:
     metadata:
       labels:
         app: frontend
+      annotations:
+        helios/frontend-build: "2025-11-10T22:00:00Z"
     spec:
       containers:
         - name: frontend
-          # --- IMPORTANT: Replace with your actual image name and tag ---
-          image: pratik9634/frontend:k8s-v1.0
-          # --- ---
-          # imagePullPolicy: IfNotPresent # If using local images
+          # Updated to new tag including health endpoint changes
+          image: pratik9634/frontend:k8s-v1.1
+          imagePullPolicy: Always
           ports:
-            - containerPort: 80 # Nginx listens on port 80
+            - containerPort: 80
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 10
           # Nginx config inside the image proxies /api requests to scheduler-service:8080
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: frontend # Service name
   namespace: helios
 spec:
   ports:

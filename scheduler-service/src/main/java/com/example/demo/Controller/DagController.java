@@ -1,7 +1,9 @@
 package com.example.demo.Controller;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.example.demo.service.OrchestratorService;
 import com.example.demo.dto.DagStatusResponse;
+import com.example.demo.dto.SystemStatusResponse; // NEW Import
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -11,24 +13,32 @@ import org.springframework.web.bind.annotation.*;
 import java.util.Map;
 
 @RestController
-@RequestMapping("/api/v1/dags")
-// We keep the CORS config here for easy development and Docker access
+@RequestMapping("/api/v1") // Base path changed to /api/v1
 @CrossOrigin(origins = {"http://localhost:3000", "http://localhost"})
 public class DagController {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(DagController.class);
-
-    // 1. We declare a dependency on our new OrchestratorService.
     private final OrchestratorService orchestratorService;
 
-    // 2. We use constructor injection to get an instance of the service from Spring.
-    // This is a best practice for dependency injection.
     @Autowired
     public DagController(OrchestratorService orchestratorService) {
         this.orchestratorService = orchestratorService;
     }
 
-    @GetMapping("/{dagId}")
+    // --- NEW ENDPOINT for System Health ---
+    @GetMapping("/system/status")
+    public ResponseEntity<SystemStatusResponse> getSystemStatus() {
+        try {
+            SystemStatusResponse status = orchestratorService.getSystemStatus();
+            return ResponseEntity.ok(status);
+        } catch (Exception e) {
+            LOGGER.error("Failed to get system status", e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+    // --- End of new endpoint ---
+
+    @GetMapping("/dags/{dagId}")
     public ResponseEntity<Object> getDagStatus(@PathVariable String dagId) {
         DagStatusResponse statusResponse = orchestratorService.getDagStatus(dagId);
         if (statusResponse != null) {
@@ -38,25 +48,19 @@ public class DagController {
         }
     }
 
-    @PostMapping
+    @PostMapping("/dags")
     public ResponseEntity<Object> submitDag(@RequestBody JsonNode dagPayload) {
         LOGGER.info("Received a new DAG submission via API endpoint.");
-
-        // 3. Instead of just logging, we now call the orchestrator to do the real work.
-        // The service will handle saving to Redis and dispatching to RabbitMQ.
         String dagId = orchestratorService.processNewDagSubmission(dagPayload);
 
-        // 4. We check the result from the service to provide a meaningful response.
         if (dagId != null) {
-            // If the service returns a DAG ID, the submission was successful.
             Map<String, String> response = Map.of(
                     "message", "DAG submitted and is being processed.",
                     "dagId", dagId,
-                    "status", "PENDING" // The initial overall status of the DAG.
+                    "status", "PENDING"
             );
             return ResponseEntity.accepted().body(response);
         } else {
-            // If the service returns null, something went wrong.
             Map<String, String> response = Map.of(
                     "message", "Failed to process DAG submission."
             );

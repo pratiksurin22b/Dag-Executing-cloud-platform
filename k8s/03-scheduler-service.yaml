@@ -19,11 +19,9 @@ spec:
       serviceAccountName: helios-scheduler-sa
       containers:
         - name: scheduler-service
-          # --- IMPORTANT: Replace with your actual image name and tag ---
-          image: pratik9634/scheduler-service:k8s-v1.2
-          # --- ---
-          # Recommended: Change pull policy if using local dev images without pushing
-          # imagePullPolicy: IfNotPresent
+          # Updated to match the latest pushed image tag
+          image: pratik9634/scheduler-service:v1.5
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
           env:

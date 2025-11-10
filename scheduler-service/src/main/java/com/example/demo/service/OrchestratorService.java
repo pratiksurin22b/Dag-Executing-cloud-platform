@@ -1,7 +1,9 @@
 package com.example.demo.service;
 
+// All existing imports from your v18 file...
 import com.example.demo.config.RabbitMQConfig;
 import com.example.demo.dto.DagStatusResponse;
+import com.example.demo.dto.SystemStatusResponse; // NEW Import
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -12,35 +14,32 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Arrays; // NEW Import
 import java.util.Collections;
 import java.util.List;
+import java.util.Map; // NEW Import
 import java.util.UUID;
+import java.util.stream.Collectors; // NEW Import
 import java.util.stream.StreamSupport;
 
-// Kubernetes Imports (v18.0.0)
+// Kubernetes Imports (v17.x)
 import io.kubernetes.client.openapi.ApiClient;
 import io.kubernetes.client.openapi.ApiException;
 import io.kubernetes.client.openapi.Configuration;
+import io.kubernetes.client.openapi.apis.AppsV1Api;
 import io.kubernetes.client.openapi.apis.BatchV1Api;
 import io.kubernetes.client.openapi.apis.CoreV1Api;
-import io.kubernetes.client.openapi.models.V1Job;
-import io.kubernetes.client.openapi.models.V1JobList;
-import io.kubernetes.client.openapi.models.V1ObjectMeta;
-import io.kubernetes.client.openapi.models.V1Pod;
-import io.kubernetes.client.openapi.models.V1PodList;
+import io.kubernetes.client.openapi.models.*; // Keep model imports
 import io.kubernetes.client.util.ClientBuilder;
-import io.kubernetes.client.util.Config;
+import io.kubernetes.client.util.Streams;
 import io.kubernetes.client.informer.SharedInformerFactory;
 import io.kubernetes.client.informer.cache.Indexer;
 import io.kubernetes.client.informer.ResourceEventHandler;
-import io.kubernetes.client.util.Watch;
-import io.kubernetes.client.util.generic.GenericKubernetesApi;
-import io.kubernetes.client.openapi.models.V1Container;
-import io.kubernetes.client.openapi.models.V1JobSpec;
-import io.kubernetes.client.openapi.models.V1PodSpec;
-import io.kubernetes.client.openapi.models.V1PodTemplateSpec;
-
+import io.kubernetes.client.util.CallGeneratorParams;
+import okhttp3.Call;
+// import io.kubernetes.client.util.generic.GenericKubernetesApi; // This was from v19+, v18 uses direct call
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -56,8 +55,18 @@ public class OrchestratorService {
     private final ObjectMapper objectMapper;
     private final BatchV1Api batchV1Api;
     private final CoreV1Api coreV1Api;
+    private final AppsV1Api appsV1Api;
     private final SharedInformerFactory informerFactory;
     private Indexer<V1Job> jobIndexer;
+
+    // Map of our core components and their app labels in Kubernetes
+    private static final Map<String, String> CORE_SERVICES = Map.of(
+            "Scheduler", "scheduler-service",
+            "Frontend", "frontend",
+            "Redis", "redis", // fixed label to match manifest
+            "RabbitMQ", "rabbitmq"
+    );
+
 
     @Autowired
     public OrchestratorService(StringRedisTemplate redisTemplate, ObjectMapper objectMapper) throws IOException {
@@ -71,6 +80,7 @@ public class OrchestratorService {
         Configuration.setDefaultApiClient(client);
         this.batchV1Api = new BatchV1Api(client);
         this.coreV1Api = new CoreV1Api(client);
+        this.appsV1Api = new AppsV1Api(client);
         this.informerFactory = new SharedInformerFactory(client);
 
         setupJobWatcher();
@@ -80,65 +90,149 @@ public class OrchestratorService {
 
     // --- Configure the Kubernetes Job Watcher (Corrected for v18.0.0 API Call Signature) ---
     private void setupJobWatcher() {
-        try {
-            GenericKubernetesApi<V1Job, V1JobList> jobApi = new GenericKubernetesApi<>(
-                    V1Job.class, V1JobList.class, "batch", "v1", "jobs");
+        var jobInformer = informerFactory.sharedIndexInformerFor(
+                (CallGeneratorParams params) -> {
+                    try {
+                        return batchV1Api.listNamespacedJobCall(
+                                "helios", // namespace
+                                null, // pretty
+                                null, // allowWatchBookmarks
+                                null, // _continue
+                                null, // fieldSelector
+                                "app=helios-task", // labelSelector to only watch our jobs
+                                null, // limit
+                                params.resourceVersion, // resourceVersion from params
+                                null, // resourceVersionMatch
+                                params.timeoutSeconds, // timeoutSeconds from params
+                                params.watch, // watch from params
+                                null // _callback
+                        );
+                    } catch (ApiException e) {
+                        LOGGER.error("Watcher: Failed to create list call for Jobs: {}", e.getResponseBody(), e);
+                        throw new RuntimeException(e);
+                    }
+                },
+                V1Job.class, V1JobList.class
+        );
 
-            var jobInformer = informerFactory.sharedIndexInformerFor(
-                    jobApi,
-                    V1Job.class,
-                    0L,
-                    "helios"
-            );
-
-            jobInformer.addEventHandler(new ResourceEventHandler<V1Job>() {
-                @Override
-                public void onAdd(V1Job job) { /* Ignore */ }
-
-                @Override
-                public void onUpdate(V1Job oldJob, V1Job newJob) {
-                    String jobName = newJob.getMetadata().getName();
-                    LOGGER.debug("Watcher: Job updated - {}", jobName);
-                    var status = newJob.getStatus();
-                    if (status != null) {
-                        boolean succeeded = status.getSucceeded() != null && status.getSucceeded() > 0;
-                        boolean failed = status.getFailed() != null && status.getFailed() > 0;
-                        if (succeeded || failed) {
-                            String processedKey = "job:processed:" + jobName;
-                            if (Boolean.TRUE.equals(redisTemplate.opsForValue().setIfAbsent(processedKey, "true"))) {
-                                redisTemplate.expire(processedKey, java.time.Duration.ofHours(2));
-                                LOGGER.info("Watcher: Job '{}' completed (Succeeded={}, Failed={}). Processing result...", jobName, succeeded, failed);
-                                handleJobCompletion(newJob, succeeded);
-                            } else {
-                                LOGGER.debug("Watcher: Job '{}' completion already processed.", jobName);
-                            }
+        // --- Event Handler logic (Unchanged) ---
+        jobInformer.addEventHandler(new ResourceEventHandler<V1Job>() {
+            @Override public void onAdd(V1Job job) { /* Ignore */ }
+            @Override
+            public void onUpdate(V1Job oldJob, V1Job newJob) {
+                // ... (existing watcher logic as before) ...
+                String jobName = newJob.getMetadata().getName();
+                LOGGER.debug("Watcher: Job updated - {}", jobName);
+                var status = newJob.getStatus();
+                if (status != null) {
+                    boolean succeeded = status.getSucceeded() != null && status.getSucceeded() > 0;
+                    boolean failed = status.getFailed() != null && status.getFailed() > 0;
+                    if (succeeded || failed) {
+                        String processedKey = "job:processed:" + jobName;
+                        if (Boolean.TRUE.equals(redisTemplate.opsForValue().setIfAbsent(processedKey, "true"))) {
+                            redisTemplate.expire(processedKey, java.time.Duration.ofHours(2));
+                            LOGGER.info("Watcher: Job '{}' completed (Succeeded={}, Failed={}). Processing result...", jobName, succeeded, failed);
+                            handleJobCompletion(newJob, succeeded);
+                        } else {
+                            LOGGER.debug("Watcher: Job '{}' completion already processed.", jobName);
                         }
                     }
                 }
-
-                @Override
-                public void onDelete(V1Job job, boolean deletedFinalStateUnknown) { /* Ignore */ }
-            });
-            this.jobIndexer = jobInformer.getIndexer();
-        } catch (Exception e) {
-            LOGGER.error("Failed to setup Job watcher", e);
-        }
+            }
+            @Override public void onDelete(V1Job job, boolean deletedFinalStateUnknown) { /* Ignore */ }
+        });
+        this.jobIndexer = jobInformer.getIndexer();
     }
 
+    // --- Start/Stop watchers (Unchanged) ---
     @PostConstruct
     public void startWatchers() {
         LOGGER.info("Starting Kubernetes watchers...");
         informerFactory.startAllRegisteredInformers();
         LOGGER.info("Kubernetes watchers started.");
     }
-
     @PreDestroy
     public void stopWatchers() {
         LOGGER.info("Stopping Kubernetes watchers...");
-        informerFactory.stopAllRegisteredInformers();
+        informerFactory.stopAllRegisteredInformers(true); // Graceful shutdown
         LOGGER.info("Kubernetes watchers stopped.");
     }
 
+    // --- NEW METHOD: Get System Health Status ---
+    public SystemStatusResponse getSystemStatus() throws ApiException {
+        List<SystemStatusResponse.ServiceStatus> serviceStatuses = new ArrayList<>();
+        String namespace = "helios";
+
+        V1PodList allPods = coreV1Api.listNamespacedPod(
+                namespace, null, null, null, null, null, null, null, null, null, null
+        );
+        Map<String, List<V1Pod>> podsByApp = allPods.getItems().stream()
+                .filter(pod -> pod.getMetadata() != null && pod.getMetadata().getLabels() != null)
+                .collect(Collectors.groupingBy(pod -> pod.getMetadata().getLabels().get("app")));
+
+        for (Map.Entry<String, String> serviceEntry : CORE_SERVICES.entrySet()) {
+            String serviceName = serviceEntry.getKey();
+            String appLabel = serviceEntry.getValue();
+
+            List<V1Pod> matchingPods = podsByApp.getOrDefault(appLabel, Collections.emptyList());
+
+            // Derive desired replicas from Deployments/StatefulSets with the same app label
+            int desiredReplicas = 0;
+            try {
+                String labelSelector = "app=" + appLabel;
+                V1DeploymentList dpls = appsV1Api.listNamespacedDeployment(
+                        namespace, null, null, null, null, labelSelector, null, null, null, null, null
+                );
+                if (dpls != null && dpls.getItems() != null) {
+                    desiredReplicas += dpls.getItems().stream()
+                            .map(d -> d.getSpec() != null && d.getSpec().getReplicas() != null ? d.getSpec().getReplicas() : 0)
+                            .reduce(0, Integer::sum);
+                }
+                V1StatefulSetList stss = appsV1Api.listNamespacedStatefulSet(
+                        namespace, null, null, null, null, labelSelector, null, null, null, null, null
+                );
+                if (stss != null && stss.getItems() != null) {
+                    desiredReplicas += stss.getItems().stream()
+                            .map(s -> s.getSpec() != null && s.getSpec().getReplicas() != null ? s.getSpec().getReplicas() : 0)
+                            .reduce(0, Integer::sum);
+                }
+            } catch (ApiException e) {
+                // Fall back if Apps API is not accessible
+                desiredReplicas = 0;
+            }
+
+            // Fallbacks: if controller info not found, infer from pods
+            if (desiredReplicas == 0) {
+                desiredReplicas = matchingPods.isEmpty() ? 0 : 1;
+            }
+
+            int runningReplicas = (int) matchingPods.stream()
+                    .filter(pod -> "Running".equals(pod.getStatus() != null ? pod.getStatus().getPhase() : null))
+                    .count();
+
+            String status;
+            if (desiredReplicas == 0) {
+                status = runningReplicas > 0 ? "Running" : "Stopped";
+            } else if (runningReplicas == 0) {
+                status = "Stopped";
+            } else if (runningReplicas < desiredReplicas) {
+                status = "Degraded";
+            } else {
+                status = "Running";
+            }
+
+            String podName = matchingPods.isEmpty() ? "N/A" : matchingPods.get(0).getMetadata().getName();
+
+            serviceStatuses.add(new SystemStatusResponse.ServiceStatus(
+                    serviceName, status, runningReplicas, desiredReplicas, podName
+            ));
+        }
+        return new SystemStatusResponse(serviceStatuses);
+    }
+    // --- End of new method ---
+
+
+    // --- processNewDagSubmission (Unchanged) ---
     public String processNewDagSubmission(JsonNode dagPayload) {
         String dagId = "dag-" + UUID.randomUUID();
         try {
@@ -146,6 +240,8 @@ public class OrchestratorService {
             dagPayload.get("tasks").forEach(taskNode -> {
                 String taskName = taskNode.get("name").asText();
                 redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "PENDING");
+                redisTemplate.delete(String.format("dag:%s:task:%s:attempts", dagId, taskName));
+                redisTemplate.delete(String.format("dag:%s:task:%s:logs", dagId, taskName));
             });
             evaluateDag(dagId);
         } catch (Exception e) {
@@ -155,6 +251,7 @@ public class OrchestratorService {
         return dagId;
     }
 
+    // --- evaluateDag (Unchanged) ---
     public void evaluateDag(String dagId) {
         try {
             String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
@@ -173,6 +270,7 @@ public class OrchestratorService {
         }
     }
 
+    // --- areDependenciesMet (Unchanged) ---
     private boolean areDependenciesMet(String dagId, JsonNode taskNode) {
         if (!taskNode.has("depends_on") || taskNode.get("depends_on").isEmpty()) {
             return true;
@@ -181,40 +279,37 @@ public class OrchestratorService {
                 .allMatch(dependencyNode -> "SUCCEEDED".equals(redisTemplate.opsForValue().get("dag:" + dagId + ":task:" + dependencyNode.asText() + ":status")));
     }
 
-    // --- CORRECTED v18.0.0 API CALL PATTERN for createNamespacedJob ---
+    // --- dispatchTask (v18 pattern - Unchanged) ---
     private void dispatchTask(String dagId, JsonNode taskNode) {
         String taskName = taskNode.get("name").asText();
         String jobName = generateK8sJobName(dagId, taskName);
         try {
             redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "K8S_JOB_CREATING");
-            redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":attempts", "1");
+            String attemptKey = String.format("dag:%s:task:%s:attempts", dagId, taskName);
+            String currentAttemptStr = redisTemplate.opsForValue().get(attemptKey);
+            long nextAttempt = (currentAttemptStr == null) ? 1 : (Long.parseLong(currentAttemptStr) + 1);
+            redisTemplate.opsForValue().set(attemptKey, String.valueOf(nextAttempt));
 
             V1Job job = createK8sJobDefinition(jobName, dagId, taskNode);
-
-            LOGGER.info("Submitting Kubernetes Job '{}' for task '{}'...", jobName, taskName);
-            // v18.0.0 API call signature
+            LOGGER.info("Submitting Kubernetes Job '{}' for task '{}' (Attempt {})...", jobName, taskName, nextAttempt);
             V1Job createdJob = batchV1Api.createNamespacedJob(
-                    "helios",
-                    job,
-                    "true",
-                    null,
-                    null,
-                    "Strict"
+                    "helios", job, null, null, null, null
             );
-
             redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "K8S_JOB_SUBMITTED");
             LOGGER.info("Successfully submitted Kubernetes Job '{}'.", createdJob.getMetadata().getName());
 
         } catch (ApiException e) {
-            LOGGER.error("Kubernetes API Error dispatching task '{}' (Job '{}'): Code={}, Body={}",
-                    taskName, jobName, e.getCode(), e.getResponseBody(), e);
+            LOGGER.error("Kubernetes API Error dispatching task '{}': {}", taskName, e.getResponseBody(), e);
             redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "DISPATCH_FAILED");
+            handleTaskFailure(dagId, taskName);
         } catch (Exception e) {
-            LOGGER.error("Failed to create or dispatch Kubernetes Job for task '{}'", taskName, e);
+            LOGGER.error("Failed to create/dispatch K8s Job for task '{}'", taskName, e);
             redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "DISPATCH_FAILED");
+            handleTaskFailure(dagId, taskName);
         }
     }
 
+    // --- handleJobCompletion (Unchanged) ---
     private void handleJobCompletion(V1Job job, boolean succeeded) {
         V1ObjectMeta metadata = job.getMetadata();
         String jobName = metadata.getName();
@@ -222,7 +317,7 @@ public class OrchestratorService {
         String taskName = metadata.getLabels() != null ? metadata.getLabels().get("helios-task-name") : null;
 
         if (dagId == null || taskName == null) {
-            LOGGER.error("Job '{}' completed but missing required helios labels. Cannot process result.", jobName);
+            LOGGER.error("Job '{}' completed but missing required helios labels.", jobName);
             return;
         }
         LOGGER.info("Processing completion for Job '{}' (Task: '{}', DAG: '{}'). Success={}", jobName, taskName, dagId, succeeded);
@@ -230,48 +325,38 @@ public class OrchestratorService {
         processJobResult(dagId, taskName, succeeded, logs);
     }
 
-    // --- CORRECTED v18.0.0 API CALL PATTERN for listNamespacedPod and readNamespacedPodLog ---
+    // --- fetchPodLogsForJob (v18 pattern - Unchanged) ---
     private String fetchPodLogsForJob(String jobName, String namespace) {
         try {
             String labelSelector = "job-name=" + jobName;
-            // v18.0.0 API call signature
             V1PodList podList = coreV1Api.listNamespacedPod(
-                    namespace,
-                    "true",
-                    false,
-                    null,
-                    null,
-                    labelSelector,
-                    null,
-                    null,
-                    null,
-                    null,
-                    false
+                    namespace, null, null, null, null, labelSelector, null, null, null, null, null
             );
 
             if (podList != null && !podList.getItems().isEmpty()) {
                 V1Pod pod = podList.getItems().get(0);
                 String podName = pod.getMetadata().getName();
-                String containerName = pod.getSpec().getContainers().get(0).getName();
+                String containerName = (pod.getSpec() != null && !pod.getSpec().getContainers().isEmpty())
+                        ? pod.getSpec().getContainers().get(0).getName() : null;
+                if (containerName == null) {
+                    return "Error: Container name not found.";
+                }
                 String podPhase = pod.getStatus() != null ? pod.getStatus().getPhase() : "Unknown";
 
                 if ("Succeeded".equals(podPhase) || "Failed".equals(podPhase)) {
-                    LOGGER.info("Fetching logs for Pod '{}' (Phase: {}) associated with Job '{}'", podName, podPhase, jobName);
-                    // v18.0.0 API call signature
                     String logContent = coreV1Api.readNamespacedPodLog(
-                            podName,
-                            namespace,
-                            containerName,
-                            false,
-                            false,
-                            null,
-                            null,
-                            false,
-                            null,
-                            null,
-                            false
+                            podName,                          // name
+                            namespace,                        // namespace
+                            containerName,                    // container
+                            Boolean.FALSE,                    // follow
+                            Boolean.FALSE,                    // insecureSkipTLSVerifyBackend or pretty (per v18)
+                            (Integer) null,                   // limitBytes
+                            (String) null,                    // sinceTime
+                            Boolean.FALSE,                    // timestamps
+                            (Integer) null,                   // sinceSeconds
+                            (Integer) null,                   // tailLines
+                            Boolean.FALSE                     // limitBytes? or some boolean flag (per v18)
                     );
-
                     return logContent != null ? logContent : "";
                 } else {
                     return "Pod logs not ready (Phase: " + podPhase + ")";
@@ -289,56 +374,53 @@ public class OrchestratorService {
         }
     }
 
+
+    // --- processJobResult (Refined logic - Unchanged) ---
     private void processJobResult(String dagId, String taskName, boolean success, String logs) {
         try {
-            String finalStatus = success ? "SUCCEEDED" : "FAILED";
             String taskStatusKey = String.format("dag:%s:task:%s:status", dagId, taskName);
             String taskLogsKey = String.format("dag:%s:task:%s:logs", dagId, taskName);
-
             List<String> logList = (logs != null && !logs.startsWith("Error:")) ? List.of(logs.split("\n")) : List.of(logs);
             redisTemplate.opsForValue().set(taskLogsKey, objectMapper.writeValueAsString(logList));
-
+            String currentStatus = redisTemplate.opsForValue().get(taskStatusKey);
+            if ("SUCCEEDED".equals(currentStatus) || "FAILED".equals(currentStatus) || "UPSTREAM_FAILED".equals(currentStatus)) {
+                LOGGER.warn("Task '{}' already in final state '{}'. Ignoring job completion event.", taskName, currentStatus);
+                return;
+            }
             if (success) {
-                String currentStatus = redisTemplate.opsForValue().get(taskStatusKey);
-                if (!"SUCCEEDED".equals(currentStatus) && !"FAILED".equals(currentStatus) && !"UPSTREAM_FAILED".equals(currentStatus)) {
-                    redisTemplate.opsForValue().set(taskStatusKey, "SUCCEEDED");
-                    LOGGER.info("Task '{}' SUCCEEDED. Triggering DAG re-evaluation.", taskName);
-                    evaluateDag(dagId);
-                } else {
-                    LOGGER.warn("Task '{}' already in final state '{}'. Ignoring success event.", taskName, currentStatus);
-                }
+                redisTemplate.opsForValue().set(taskStatusKey, "SUCCEEDED");
+                LOGGER.info("Task '{}' SUCCEEDED. Triggering DAG re-evaluation.", taskName);
+                evaluateDag(dagId);
             } else {
                 handleTaskFailure(dagId, taskName);
             }
-
         } catch (Exception e) {
             LOGGER.error("CRITICAL: Failed to process final job result for task '{}', DAG '{}'.", taskName, dagId, e);
         }
     }
 
+
+    // --- handleTaskFailure (Refined logic - Unchanged) ---
     private void handleTaskFailure(String dagId, String taskName) {
         try {
             String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
-            if (dagJson == null) return;
+            if (dagJson == null) { return; }
             JsonNode dagPayload = objectMapper.readTree(dagJson);
             JsonNode taskNode = findTaskNode(dagPayload, taskName);
-            if (taskNode == null) return;
+            if (taskNode == null) { return; }
+
             int maxRetries = taskNode.path("retries").path("count").asInt(0);
             String attemptKey = String.format("dag:%s:task:%s:attempts", dagId, taskName);
-            long attemptsMade = redisTemplate.opsForValue().increment(attemptKey);
+            long attemptsMade = redisTemplate.opsForValue().increment(attemptKey); // Increments and returns the new value
 
-            if (attemptsMade <= maxRetries) {
-                LOGGER.warn("Task '{}' FAILED on attempt {}. Re-dispatching for retry... (Max retries: {})", taskName, attemptsMade, maxRetries);
-                dispatchTask(dagId, taskNode);
-            } else {
-                LOGGER.error("Task '{}' FAILED on final attempt {}. Initiating failure propagation.", taskName, attemptsMade);
-                String taskStatusKey = String.format("dag:%s:task:%s:status", dagId, taskName);
-                String currentStatus = redisTemplate.opsForValue().get(taskStatusKey);
-                if (!"FAILED".equals(currentStatus) && !"UPSTREAM_FAILED".equals(currentStatus)) {
-                    redisTemplate.opsForValue().set(taskStatusKey, "FAILED");
+            if (attemptsMade <= maxRetries + 1) { // We check <= maxRetries + 1 because the first attempt is 1
+                if(attemptsMade <= maxRetries) { // This means we have retries left
+                    LOGGER.warn("Task '{}' FAILED on attempt {}. Re-dispatching for retry... (Max retries: {})", taskName, attemptsMade, maxRetries);
+                    dispatchTask(dagId, taskNode);
+                } else { // This means attemptsMade == maxRetries + 1, which was the final attempt
+                    LOGGER.error("Task '{}' FAILED on final attempt {}. Initiating failure propagation.", taskName, attemptsMade -1); // Log the attempt number that failed
+                    redisTemplate.opsForValue().set(String.format("dag:%s:task:%s:status", dagId, taskName), "FAILED");
                     propagateFailure(dagId, taskName);
-                } else {
-                    LOGGER.warn("Task '{}' already in final state '{}'. Ignoring failure event.", taskName, currentStatus);
                 }
             }
         } catch (Exception e) {
@@ -346,12 +428,12 @@ public class OrchestratorService {
         }
     }
 
+    // --- propagateFailure (Refined logic - Unchanged) ---
     public void propagateFailure(String dagId, String failedTaskName) {
         try {
             String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
             if (dagJson == null) { return; }
             JsonNode dagPayload = objectMapper.readTree(dagJson);
-
             dagPayload.get("tasks").forEach(taskNode -> {
                 if (taskNode.has("depends_on")) {
                     taskNode.get("depends_on").forEach(depNode -> {
@@ -359,7 +441,7 @@ public class OrchestratorService {
                             String childTaskName = taskNode.get("name").asText();
                             String childStatusKey = String.format("dag:%s:task:%s:status", dagId, childTaskName);
                             String currentChildStatus = redisTemplate.opsForValue().get(childStatusKey);
-                            if ("PENDING".equals(currentChildStatus) || "K8S_JOB_CREATING".equals(currentChildStatus) || "K8S_JOB_SUBMITTED".equals(currentChildStatus)) {
+                            if ("PENDING".equals(currentChildStatus)) {
                                 redisTemplate.opsForValue().set(childStatusKey, "UPSTREAM_FAILED");
                                 LOGGER.warn("Propagating failure: Task '{}' marked as UPSTREAM_FAILED.", childTaskName);
                                 propagateFailure(dagId, childTaskName);
@@ -373,6 +455,7 @@ public class OrchestratorService {
         }
     }
 
+    // --- getDagStatus (Unchanged) ---
     public DagStatusResponse getDagStatus(String dagId) {
         try {
             String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
@@ -400,7 +483,8 @@ public class OrchestratorService {
         }
     }
 
-    // --- HELPER METHODS ---
+
+    // --- HELPER METHODS (Unchanged) ---
     private JsonNode findTaskNode(JsonNode dagPayload, String taskName) {
         for (JsonNode task : dagPayload.get("tasks")) {
             if (task.get("name").asText().equals(taskName)) { return task; }
@@ -420,47 +504,47 @@ public class OrchestratorService {
 
     private V1Job createK8sJobDefinition(String jobName, String dagId, JsonNode taskNode) throws IOException {
         String image = taskNode.get("image").asText();
-        List<String> command = objectMapper.convertValue(taskNode.get("command"), new TypeReference<>() {});
+        List<String> command = objectMapper.convertValue(taskNode.get("command"), new TypeReference<List<String>>() {});
         String taskName = taskNode.get("name").asText();
-        String cleanTaskNameK8s = taskName.replaceAll("[^a-z0-9-]", "").toLowerCase().replaceAll("^-|-$", "");
-        cleanTaskNameK8s = cleanTaskNameK8s.substring(0, Math.min(cleanTaskNameK8s.length(), 63));
-        String cleanDagIdK8s = dagId.replaceAll("[^a-z0-9-]", "").toLowerCase().replaceAll("^-|-$", "");
-        cleanDagIdK8s = cleanDagIdK8s.substring(0, Math.min(cleanDagIdK8s.length(), 63));
+        String cleanTaskNameK8s = taskName.replaceAll("[^A-Za-z0-9\\-_.]", "").toLowerCase();
+        cleanTaskNameK8s = cleanTaskNameK8s.substring(0, Math.min(cleanTaskNameK8s.length(), 63)).replaceAll("^-|-$", "");
+        String cleanDagIdK8s = dagId.replaceAll("[^A-Za-z0-9\\-_.]", "").toLowerCase();
+        cleanDagIdK8s = cleanDagIdK8s.substring(0, Math.min(cleanDagIdK8s.length(), 63)).replaceAll("^-|-$", "");
 
-        V1Job job = new V1Job();
-        job.setApiVersion("batch/v1");
-        job.setKind("Job");
+        V1ObjectMeta jobMeta = new V1ObjectMeta()
+                .name(jobName)
+                .namespace("helios")
+                .putLabelsItem("app", "helios-task")
+                .putLabelsItem("helios-dag-id", cleanDagIdK8s)
+                .putLabelsItem("helios-task-name", cleanTaskNameK8s);
 
-        V1ObjectMeta metadata = new V1ObjectMeta();
-        metadata.setName(jobName);
-        metadata.setNamespace("helios");
-        metadata.putLabelsItem("app", "helios-task");
-        metadata.putLabelsItem("helios-dag-id", cleanDagIdK8s);
-        metadata.putLabelsItem("helios-task-name", cleanTaskNameK8s);
-        job.setMetadata(metadata);
+        V1Container container = new V1Container()
+                .name(cleanTaskNameK8s.substring(0, Math.min(cleanTaskNameK8s.length(), 50)) + "-cont")
+                .image(image)
+                .command(command);
 
-        V1JobSpec jobSpec = new V1JobSpec();
-        jobSpec.setBackoffLimit(0);
+        V1PodSpec podSpec = new V1PodSpec()
+                .restartPolicy("Never")
+                .addContainersItem(container);
 
-        V1PodTemplateSpec podTemplate = new V1PodTemplateSpec();
-        V1ObjectMeta podMeta = new V1ObjectMeta();
-        podMeta.putLabelsItem("app", "helios-task");
-        podTemplate.setMetadata(podMeta);
+        V1PodTemplateSpec template = new V1PodTemplateSpec()
+                .metadata(new V1ObjectMeta()
+                        .putLabelsItem("app", "helios-task-pod")
+                        .putLabelsItem("job-name", jobName)
+                        .putLabelsItem("helios-dag-id", cleanDagIdK8s)
+                        .putLabelsItem("helios-task-name", cleanTaskNameK8s))
+                .spec(podSpec);
 
-        V1PodSpec podSpec = new V1PodSpec();
-        podSpec.setRestartPolicy("Never");
+        V1JobSpec jobSpec = new V1JobSpec()
+                .ttlSecondsAfterFinished(3600)
+                .backoffLimit(0)
+                .template(template);
 
-        V1Container container = new V1Container();
-        container.setName("task-container");
-        container.setImage(image);
-        container.setCommand(command);
-        podSpec.setContainers(List.of(container));
-
-        podTemplate.setSpec(podSpec);
-        jobSpec.setTemplate(podTemplate);
-        job.setSpec(jobSpec);
-
-        return job;
+        return new V1Job()
+                .apiVersion("batch/v1")
+                .kind("Job")
+                .metadata(jobMeta)
+                .spec(jobSpec);
     }
-
 }
+

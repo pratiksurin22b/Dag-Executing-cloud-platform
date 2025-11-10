@@ -1,9 +1,7 @@
-# Use the correct and available official tag for a minimal Java 17 environment
-FROM openjdk:17-jdk-slim
+# Runtime image for Java 17 using Eclipse Temurin JRE (stable and small)
+FROM eclipse-temurin:17-jre-jammy
 
-# The rest of the file remains exactly the same
 WORKDIR /app
 COPY target/*.jar app.jar
 EXPOSE 8080
 ENTRYPOINT ["java", "-jar", "app.jar"]
-

@@ -15,20 +15,13 @@
     <artifactId>scheduler-service</artifactId>
     <version>0.0.1-SNAPSHOT</version>
     <name>scheduler-service</name>
-    <description>Helios DAG Orchestrator Service</description>
+    <description>Helios DAG Orchestrator Service (Phase 7 - K8s Native)</description>
 
     <properties>
         <java.version>17</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <kubernetes-client.version>18.0.0</kubernetes-client.version>
     </properties>
-
-    <repositories>
-        <repository>
-            <id>central</id>
-            <url>https://repo1.maven.org/maven2</url>
-        </repository>
-    </repositories>
 
     <dependencies>
         <!-- Spring Boot Starters -->
@@ -55,33 +48,26 @@
             <artifactId>jackson-databind</artifactId>
         </dependency>
 
-        <!-- Kubernetes Java Client - Use compatible version -->
+        <!-- Kubernetes Java Client v18 -->
         <dependency>
             <groupId>io.kubernetes</groupId>
             <artifactId>client-java</artifactId>
             <version>${kubernetes-client.version}</version>
         </dependency>
+        <dependency>
+            <groupId>io.kubernetes</groupId>
+            <artifactId>client-java-extended</artifactId>
+            <version>${kubernetes-client.version}</version>
+        </dependency>
 
-        <!-- Jakarta Annotation API -->
+        <!-- Jakarta Annotation API (for @PostConstruct/@PreDestroy) -->
         <dependency>
             <groupId>jakarta.annotation</groupId>
             <artifactId>jakarta.annotation-api</artifactId>
         </dependency>
 
-        <!-- Common transitive dependencies -->
-        <dependency>
-            <groupId>com.google.code.gson</groupId>
-            <artifactId>gson</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.yaml</groupId>
-            <artifactId>snakeyaml</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
-        </dependency>
     </dependencies>
+
     <build>
         <plugins>
             <plugin>
