@@ -106,16 +106,21 @@ public class TaskListener {
 
             // Send the message to the dedicated results queue
             rabbitTemplate.convertAndSend(RabbitMQConfig.TASK_RESULTS_QUEUE, resultMessage);
-            LOGGER.info("Reported final status '{}' for task '{}' to the results queue.", result.get("status").asText(), result.get("taskName").asText());
+            LOGGER.info("Reported final status '{}' for task '{}' to the results queue.", result.get("status").asText(),
+                    result.get("taskName").asText());
         } catch (Exception e) {
-            LOGGER.error("CRITICAL: Could not report task result back to the scheduler. This could cause the DAG to stall.", e);
+            LOGGER.error(
+                    "CRITICAL: Could not report task result back to the scheduler. This could cause the DAG to stall.",
+                    e);
         }
     }
 
     /**
      * Captures stdout and stderr from a completed container.
+     * 
      * @return A List containing all log lines.
      */
+
     private List<String> captureLogs(String containerId) throws InterruptedException {
         final List<String> logs = new ArrayList<>();
         LogContainerResultCallback loggingCallback = new LogContainerResultCallback() {
@@ -124,7 +129,8 @@ public class TaskListener {
                 logs.add(new String(item.getPayload()).trim());
             }
         };
-        dockerClient.logContainerCmd(containerId).withStdOut(true).withStdErr(true).exec(loggingCallback).awaitCompletion();
+        dockerClient.logContainerCmd(containerId).withStdOut(true).withStdErr(true).exec(loggingCallback)
+                .awaitCompletion();
         return logs;
     }
 
