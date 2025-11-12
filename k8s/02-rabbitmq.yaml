@@ -1,12 +1,40 @@
-# 02-rabbitmq.yaml
-# Deploys RabbitMQ using a StatefulSet and exposes it via a Service.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rabbitmq-secret
+  namespace: helios
+  labels:
+    app: rabbitmq
+type: Opaque
+data:
+  username: aGVsaW9z
+  password: aGVsaW9z
+  erlang-cookie: aGVsaW9zLWNvb2tpZS1zZWNyZXQ=
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-config
+  namespace: helios
+  labels:
+    app: rabbitmq
+data:
+  rabbitmq.conf: |
+    # Raise memory watermark to reduce false alarms
+    vm_memory_high_watermark.relative = 0.8
+    # Reduce disk alarm threshold for dev
+    disk_free_limit.absolute = 100MB
+    # Use RSS memory calculation for more accurate memory reporting
+    vm_memory_calculation_strategy = rss
+---
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: rabbitmq
   namespace: helios
+  labels:
+    app: rabbitmq
 spec:
-  serviceName: "rabbitmq"
   replicas: 1
   selector:
     matchLabels:
@@ -16,34 +44,108 @@ spec:
       labels:
         app: rabbitmq
     spec:
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        fsGroup: 999
+        runAsUser: 999
+        runAsGroup: 999
+      initContainers:
+        - name: fix-perms
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 999:999 /var/lib/rabbitmq || true"]
+          volumeMounts:
+            - name: rabbitmq-data
+              mountPath: /var/lib/rabbitmq
       containers:
         - name: rabbitmq
-          image: rabbitmq:3.13-management-alpine # Includes the management UI
+          image: rabbitmq:3.13-management
+          imagePullPolicy: IfNotPresent
           ports:
-            - containerPort: 5672
-              name: amqp # Port for application connections
-            - containerPort: 15672
-              name: management # Port for the web UI
+            - name: amqp
+              containerPort: 5672
+            - name: http
+              containerPort: 15672
           env:
-            # Default credentials for development
             - name: RABBITMQ_DEFAULT_USER
-              value: "guest"
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secret
+                  key: username
             - name: RABBITMQ_DEFAULT_PASS
-              value: "guest"
-          # Note: Production would require persistent volumes and potentially clustering.
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secret
+                  key: password
+            - name: RABBITMQ_ERLANG_COOKIE
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secret
+                  key: erlang-cookie
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+          volumeMounts:
+            - name: rabbitmq-config
+              mountPath: /etc/rabbitmq
+              readOnly: true
+            - name: rabbitmq-data
+              mountPath: /var/lib/rabbitmq
+          startupProbe:
+            tcpSocket:
+              port: 5672
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket:
+              port: 5672
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 5672
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10 && rabbitmqctl stop"]
+      volumes:
+        - name: rabbitmq-config
+          configMap:
+            name: rabbitmq-config
+        - name: rabbitmq-data
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: rabbitmq # Service name used for DNS (rabbitmq.helios.svc.cluster.local)
+  name: rabbitmq
   namespace: helios
+  labels:
+    app: rabbitmq
 spec:
-  ports:
-    - port: 5672
-      targetPort: amqp
-      name: amqp
-    - port: 15672
-      targetPort: management
-      name: management # Allows accessing the UI (via port-forward or Ingress later)
+  type: ClusterIP
   selector:
     app: rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: 5672
+      protocol: TCP
+    - name: http
+      port: 15672
+      targetPort: 15672
+      protocol: TCP

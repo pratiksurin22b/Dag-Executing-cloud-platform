@@ -20,19 +20,19 @@ spec:
       containers:
         - name: frontend
           # Updated to new tag including health endpoint changes
-          image: pratik9634/frontend:k8s-v1.1
+          image: pratik9634/frontend:healthfix
           imagePullPolicy: Always
           ports:
             - containerPort: 80
           livenessProbe:
             httpGet:
-              path: /health
+              path: /
               port: 80
             initialDelaySeconds: 5
             periodSeconds: 30
           readinessProbe:
             httpGet:
-              path: /health
+              path: /
               port: 80
             initialDelaySeconds: 3
             periodSeconds: 10
@@ -41,6 +41,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
+  name: frontend
   namespace: helios
 spec:
   ports:

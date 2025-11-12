@@ -3,7 +3,7 @@ package com.example.demo.service;
 // All existing imports from your v18 file...
 import com.example.demo.config.RabbitMQConfig;
 import com.example.demo.dto.DagStatusResponse;
-import com.example.demo.dto.SystemStatusResponse; // NEW Import
+import com.example.demo.dto.SystemStatusResponse; // ensure import
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -18,8 +18,10 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays; // NEW Import
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map; // NEW Import
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors; // NEW Import
 import java.util.stream.StreamSupport;
@@ -177,12 +179,14 @@ public class OrchestratorService {
             List<V1Pod> matchingPods = podsByApp.getOrDefault(appLabel, Collections.emptyList());
 
             int desiredReplicas = 0;
+            boolean hasDeploymentOrSts = false;
             try {
                 String labelSelector = "app=" + appLabel;
                 V1DeploymentList dpls = appsV1Api.listNamespacedDeployment(
                         namespace, null, null, null, null, labelSelector, null, null, null, null, null
                 );
-                if (dpls != null && dpls.getItems() != null) {
+                if (dpls != null && dpls.getItems() != null && !dpls.getItems().isEmpty()) {
+                    hasDeploymentOrSts = true;
                     desiredReplicas += dpls.getItems().stream()
                             .map(d -> d.getSpec() != null && d.getSpec().getReplicas() != null ? d.getSpec().getReplicas() : 0)
                             .reduce(0, Integer::sum);
@@ -190,7 +194,8 @@ public class OrchestratorService {
                 V1StatefulSetList stss = appsV1Api.listNamespacedStatefulSet(
                         namespace, null, null, null, null, labelSelector, null, null, null, null, null
                 );
-                if (stss != null && stss.getItems() != null) {
+                if (stss != null && stss.getItems() != null && !stss.getItems().isEmpty()) {
+                    hasDeploymentOrSts = true;
                     desiredReplicas += stss.getItems().stream()
                             .map(s -> s.getSpec() != null && s.getSpec().getReplicas() != null ? s.getSpec().getReplicas() : 0)
                             .reduce(0, Integer::sum);
@@ -198,7 +203,8 @@ public class OrchestratorService {
             } catch (ApiException e) {
                 desiredReplicas = 0;
             }
-            if (desiredReplicas == 0) {
+            // If no controller found, infer desired from pods presence (fallback 1 if any pod exists)
+            if (!hasDeploymentOrSts) {
                 desiredReplicas = matchingPods.isEmpty() ? 0 : 1;
             }
 
@@ -207,7 +213,8 @@ public class OrchestratorService {
             int pendingReplicas = 0;
             int crashLoopingReplicas = 0;
             int imagePullBackOffReplicas = 0;
-            int runningPhaseReplicas = 0; // pods with phase Running (may not be ready)
+            int runningPhaseReplicas = 0;
+            int unresponsiveReplicas = 0; // Running but not Ready and no explicit waiting reason
 
             List<SystemStatusResponse.PodBrief> podBriefs = new ArrayList<>();
             for (V1Pod pod : matchingPods) {
@@ -215,53 +222,76 @@ public class OrchestratorService {
                 boolean allContainersReady = true;
                 int totalRestarts = 0;
                 String reason = null;
+                Set<String> waitingReasons = new HashSet<>();
+                List<String> trueConditions = new ArrayList<>();
+
+                if (pod.getStatus() != null && pod.getStatus().getConditions() != null) {
+                    for (V1PodCondition c : pod.getStatus().getConditions()) {
+                        if ("True".equalsIgnoreCase(c.getStatus())) {
+                            if (c.getType() != null) trueConditions.add(c.getType());
+                        }
+                    }
+                }
+
                 if (pod.getStatus() != null && pod.getStatus().getContainerStatuses() != null) {
                     for (V1ContainerStatus cStatus : pod.getStatus().getContainerStatuses()) {
                         totalRestarts += cStatus.getRestartCount() != null ? cStatus.getRestartCount() : 0;
                         boolean ready = Boolean.TRUE.equals(cStatus.getReady());
                         if (!ready) allContainersReady = false;
-                        if (cStatus.getState() != null && cStatus.getState().getWaiting() != null) {
-                            String waitingReason = cStatus.getState().getWaiting().getReason();
-                            if (waitingReason != null) {
-                                reason = waitingReason;
-                                if ("CrashLoopBackOff".equals(waitingReason)) crashLoopingReplicas++;
-                                if (waitingReason.contains("ImagePullBackOff") || waitingReason.contains("ErrImagePull")) imagePullBackOffReplicas++;
+                        if (cStatus.getState() != null) {
+                            V1ContainerStateWaiting waiting = cStatus.getState().getWaiting();
+                            if (waiting != null && waiting.getReason() != null) {
+                                reason = waiting.getReason();
+                                waitingReasons.add(waiting.getReason());
+                                if ("CrashLoopBackOff".equals(waiting.getReason())) crashLoopingReplicas++;
+                                if (waiting.getReason().contains("ImagePullBackOff") || waiting.getReason().contains("ErrImagePull")) imagePullBackOffReplicas++;
                             }
                         }
                     }
                 } else {
                     allContainersReady = false;
                 }
+
                 if ("Pending".equals(phase)) pendingReplicas++;
                 if ("Running".equals(phase)) runningPhaseReplicas++;
                 if (allContainersReady && "Running".equals(phase)) {
                     readyReplicas++;
                 } else if ("Running".equals(phase)) {
                     notReadyReplicas++;
+                    if (waitingReasons.isEmpty()) {
+                        unresponsiveReplicas++;
+                    }
                 }
+
                 podBriefs.add(new SystemStatusResponse.PodBrief(
                         pod.getMetadata() != null ? pod.getMetadata().getName() : "unknown",
                         phase,
                         allContainersReady && "Running".equals(phase),
                         totalRestarts,
-                        reason
+                        reason,
+                        trueConditions,
+                        new ArrayList<>(waitingReasons)
                 ));
             }
 
             // Derive high-level status
             String status;
-            if (desiredReplicas == 0) {
-                status = runningPhaseReplicas > 0 ? "Running" : "Stopped";
+            if (hasDeploymentOrSts && desiredReplicas == 0) {
+                status = "ScaledDown";
+            } else if (desiredReplicas == 0) {
+                status = runningPhaseReplicas > 0 ? "Healthy" : "Stopped";
             } else if (runningPhaseReplicas == 0 && pendingReplicas > 0) {
-                status = "Starting"; // pods pending scheduling/pulling
+                status = "Starting";
             } else if (readyReplicas == desiredReplicas && desiredReplicas > 0) {
-                status = "Running";
+                status = "Healthy";
             } else if (crashLoopingReplicas > 0) {
                 status = "CrashLoop";
             } else if (imagePullBackOffReplicas > 0) {
                 status = "ImagePullError";
+            } else if (unresponsiveReplicas > 0) {
+                status = "Unresponsive";
             } else if (readyReplicas == 0 && runningPhaseReplicas > 0) {
-                status = "NotReady"; // running but containers not all ready
+                status = "NotReady";
             } else if (readyReplicas < desiredReplicas && readyReplicas > 0) {
                 status = "Degraded";
             } else if (runningPhaseReplicas == 0 && desiredReplicas > 0) {

@@ -199,7 +199,19 @@ const SystemMonitor = () => {
     };
 
     const getStatusIndicator = (status) => {
-        const color = status === 'Running' ? '#00ff8c' : (status === 'Degraded' ? '#f59e0b' : '#ff4d4d');
+        const colorMap = {
+            Healthy: '#00ff8c',
+            Degraded: '#f59e0b',
+            CrashLoop: '#ff4d4d',
+            ImagePullError: '#ff4d4d',
+            NotReady: '#f59e0b',
+            Unresponsive: '#ff4d4d',
+            Starting: '#94a3b8',
+            Stopped: '#94a3b8',
+            ScaledDown: '#94a3b8',
+            Unknown: '#ff4d4d'
+        };
+        const color = colorMap[status] || '#94a3b8';
         return (
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 <span style={{ width: '10px', height: '10px', backgroundColor: color, borderRadius: '50%', boxShadow: `0 0 8px ${color}` }}></span>
@@ -225,11 +237,36 @@ const SystemMonitor = () => {
                                     <strong>Status:</strong> {getStatusIndicator(service.status)}
                                 </div>
                                 <div style={styles.serviceInfo}>
-                                    <strong>Pods:</strong> <span>{service.runningReplicas} / {service.desiredReplicas} Running</span>
+                                    <strong>Replicas:</strong> <span>{service.readyReplicas}/{service.desiredReplicas} Ready</span>
                                 </div>
                                 <div style={styles.serviceInfo}>
-                                    <strong>Pod Name:</strong> <span style={styles.podName}>{service.podName}</span>
+                                    <strong>Phase Summary:</strong>
+                                    <span style={{ fontSize: '12px' }}>Running:{service.runningReplicas} Pending:{service.pendingReplicas} Crash:{service.crashLoopingReplicas} ImgErr:{service.imagePullBackOffReplicas}</span>
                                 </div>
+                                <div style={styles.serviceInfo}>
+                                    <strong>First Pod:</strong> <span style={styles.podName}>{service.podName}</span>
+                                </div>
+                                {service.pods && service.pods.length > 0 && (
+                                    <div style={{ marginTop: '6px', background: '#0a0f18', border: '1px solid #334155', borderRadius: '6px', padding: '8px', maxHeight: '180px', overflowY: 'auto' }}>
+                                        {service.pods.map(p => (
+                                            <div key={p.name} style={{ padding: '6px 0', borderBottom: '1px dashed #334155' }}>
+                                                <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: 'monospace', fontSize: '12px' }}>
+                                                    <span style={{ color: '#94a3b8', maxWidth: '55%' }}>{p.name}</span>
+                                                    <span style={{ color: p.ready ? '#00ff8c' : '#f59e0b' }}>{p.phase}{p.reason ? ` (${p.reason})` : ''}</span>
+                                                </div>
+                                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '4px' }}>
+                                                    {p.trueConditions && p.trueConditions.map(c => (
+                                                        <span key={c} style={{ background: '#1e293b', padding: '2px 6px', borderRadius: '4px', fontSize: '11px', color: '#00f5ff', border: '1px solid #334155' }}>{c}</span>
+                                                    ))}
+                                                    {p.containerWaitingReasons && p.containerWaitingReasons.map(r => (
+                                                        <span key={r} style={{ background: '#331d1d', padding: '2px 6px', borderRadius: '4px', fontSize: '11px', color: '#ff4d4d', border: '1px solid #7f1d1d' }}>{r}</span>
+                                                    ))}
+                                                    <span style={{ background: '#0f172a', padding: '2px 6px', borderRadius: '4px', fontSize: '11px', color: '#94a3b8', border: '1px solid #334155' }}>restarts:{p.restarts}</span>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
                             </div>
                         ))
                     ) : (
@@ -402,3 +439,4 @@ const styles = {
 };
 
 export default App;
+

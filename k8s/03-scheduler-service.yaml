@@ -20,8 +20,8 @@ spec:
       containers:
         - name: scheduler-service
           # Updated to match the latest pushed image tag
-          image: pratik9634/scheduler-service:uichange
-          imagePullPolicy: IfNotPresent
+          image: pratik9634/scheduler-service:healthfix
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
           env:
@@ -30,6 +30,29 @@ spec:
               value: "rabbitmq.helios.svc.cluster.local" # service-name.namespace.svc.cluster.local
             - name: SPRING_DATA_REDIS_HOST
               value: "redis.helios.svc.cluster.local"
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
 ---
 apiVersion: v1
 kind: Service
