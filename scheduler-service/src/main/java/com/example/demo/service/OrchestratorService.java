@@ -176,7 +176,6 @@ public class OrchestratorService {
 
             List<V1Pod> matchingPods = podsByApp.getOrDefault(appLabel, Collections.emptyList());
 
-            // Derive desired replicas from Deployments/StatefulSets with the same app label
             int desiredReplicas = 0;
             try {
                 String labelSelector = "app=" + appLabel;
@@ -197,34 +196,97 @@ public class OrchestratorService {
                             .reduce(0, Integer::sum);
                 }
             } catch (ApiException e) {
-                // Fall back if Apps API is not accessible
                 desiredReplicas = 0;
             }
-
-            // Fallbacks: if controller info not found, infer from pods
             if (desiredReplicas == 0) {
                 desiredReplicas = matchingPods.isEmpty() ? 0 : 1;
             }
 
-            int runningReplicas = (int) matchingPods.stream()
-                    .filter(pod -> "Running".equals(pod.getStatus() != null ? pod.getStatus().getPhase() : null))
-                    .count();
+            int readyReplicas = 0;
+            int notReadyReplicas = 0;
+            int pendingReplicas = 0;
+            int crashLoopingReplicas = 0;
+            int imagePullBackOffReplicas = 0;
+            int runningPhaseReplicas = 0; // pods with phase Running (may not be ready)
 
-            String status;
-            if (desiredReplicas == 0) {
-                status = runningReplicas > 0 ? "Running" : "Stopped";
-            } else if (runningReplicas == 0) {
-                status = "Stopped";
-            } else if (runningReplicas < desiredReplicas) {
-                status = "Degraded";
-            } else {
-                status = "Running";
+            List<SystemStatusResponse.PodBrief> podBriefs = new ArrayList<>();
+            for (V1Pod pod : matchingPods) {
+                String phase = pod.getStatus() != null ? pod.getStatus().getPhase() : "Unknown";
+                boolean allContainersReady = true;
+                int totalRestarts = 0;
+                String reason = null;
+                if (pod.getStatus() != null && pod.getStatus().getContainerStatuses() != null) {
+                    for (V1ContainerStatus cStatus : pod.getStatus().getContainerStatuses()) {
+                        totalRestarts += cStatus.getRestartCount() != null ? cStatus.getRestartCount() : 0;
+                        boolean ready = Boolean.TRUE.equals(cStatus.getReady());
+                        if (!ready) allContainersReady = false;
+                        if (cStatus.getState() != null && cStatus.getState().getWaiting() != null) {
+                            String waitingReason = cStatus.getState().getWaiting().getReason();
+                            if (waitingReason != null) {
+                                reason = waitingReason;
+                                if ("CrashLoopBackOff".equals(waitingReason)) crashLoopingReplicas++;
+                                if (waitingReason.contains("ImagePullBackOff") || waitingReason.contains("ErrImagePull")) imagePullBackOffReplicas++;
+                            }
+                        }
+                    }
+                } else {
+                    allContainersReady = false;
+                }
+                if ("Pending".equals(phase)) pendingReplicas++;
+                if ("Running".equals(phase)) runningPhaseReplicas++;
+                if (allContainersReady && "Running".equals(phase)) {
+                    readyReplicas++;
+                } else if ("Running".equals(phase)) {
+                    notReadyReplicas++;
+                }
+                podBriefs.add(new SystemStatusResponse.PodBrief(
+                        pod.getMetadata() != null ? pod.getMetadata().getName() : "unknown",
+                        phase,
+                        allContainersReady && "Running".equals(phase),
+                        totalRestarts,
+                        reason
+                ));
             }
 
-            String podName = matchingPods.isEmpty() ? "N/A" : matchingPods.get(0).getMetadata().getName();
+            // Derive high-level status
+            String status;
+            if (desiredReplicas == 0) {
+                status = runningPhaseReplicas > 0 ? "Running" : "Stopped";
+            } else if (runningPhaseReplicas == 0 && pendingReplicas > 0) {
+                status = "Starting"; // pods pending scheduling/pulling
+            } else if (readyReplicas == desiredReplicas && desiredReplicas > 0) {
+                status = "Running";
+            } else if (crashLoopingReplicas > 0) {
+                status = "CrashLoop";
+            } else if (imagePullBackOffReplicas > 0) {
+                status = "ImagePullError";
+            } else if (readyReplicas == 0 && runningPhaseReplicas > 0) {
+                status = "NotReady"; // running but containers not all ready
+            } else if (readyReplicas < desiredReplicas && readyReplicas > 0) {
+                status = "Degraded";
+            } else if (runningPhaseReplicas == 0 && desiredReplicas > 0) {
+                status = "Stopped";
+            } else {
+                status = "Unknown";
+            }
+
+            String firstRunningPodName = matchingPods.stream()
+                    .filter(p -> "Running".equals(p.getStatus() != null ? p.getStatus().getPhase() : null))
+                    .map(p -> p.getMetadata() != null ? p.getMetadata().getName() : "N/A")
+                    .findFirst().orElse("N/A");
 
             serviceStatuses.add(new SystemStatusResponse.ServiceStatus(
-                    serviceName, status, runningReplicas, desiredReplicas, podName
+                    serviceName,
+                    status,
+                    runningPhaseReplicas,
+                    desiredReplicas,
+                    firstRunningPodName,
+                    readyReplicas,
+                    notReadyReplicas,
+                    pendingReplicas,
+                    crashLoopingReplicas,
+                    imagePullBackOffReplicas,
+                    podBriefs
             ));
         }
         return new SystemStatusResponse(serviceStatuses);
