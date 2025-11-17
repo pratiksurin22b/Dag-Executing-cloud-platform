@@ -11,6 +11,12 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+    environment:
+      HELIOS_ARTIFACTS_ENDPOINT: "http://minio:9000"
+      HELIOS_ARTIFACTS_BUCKET: "helios-artifacts"
+      HELIOS_ARTIFACTS_ACCESS_KEY: "admin"
+      HELIOS_ARTIFACTS_SECRET_KEY: "password"
+
 
   # The React Frontend Service (served by Nginx)
   frontend:
@@ -47,17 +53,35 @@ services:
       timeout: 5s
       retries: 5
 
+  # MinIO object storage for DAG artifacts
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"  # S3-compatible API
+      - "9001:9001"  # MinIO console
+    environment:
+      MINIO_ROOT_USER: "admin"
+      MINIO_ROOT_PASSWORD: "password"
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
   # --- NEW: The Generic Worker Service ---
   generic-worker:
     build:
       context: ./generic-worker
     container_name: generic-worker
-    # The worker must wait for RabbitMQ to be ready before it starts.
     depends_on:
       rabbitmq:
         condition: service_healthy
-    # This is the crucial part that gives this container control over Docker.
-    # It maps the host's Docker socket into the container.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 
+volumes:
+  minio-data:

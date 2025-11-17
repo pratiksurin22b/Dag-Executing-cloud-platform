@@ -30,6 +30,20 @@ spec:
               value: "rabbitmq.helios.svc.cluster.local" # service-name.namespace.svc.cluster.local
             - name: SPRING_DATA_REDIS_HOST
               value: "redis.helios.svc.cluster.local"
+            - name: HELIOS_ARTIFACTS_ENDPOINT
+              value: "http://minio.helios.svc.cluster.local:9000"
+            - name: HELIOS_ARTIFACTS_BUCKET
+              value: "helios-artifacts"
+            - name: HELIOS_ARTIFACTS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: access-key
+            - name: HELIOS_ARTIFACTS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: secret-key
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness

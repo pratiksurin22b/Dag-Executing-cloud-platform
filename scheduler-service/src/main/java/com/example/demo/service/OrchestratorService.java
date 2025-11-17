@@ -65,9 +65,13 @@ public class OrchestratorService {
     private static final Map<String, String> CORE_SERVICES = Map.of(
             "Scheduler", "scheduler-service",
             "Frontend", "frontend",
-            "Redis", "redis", // fixed label to match manifest
-            "RabbitMQ", "rabbitmq"
+            "Redis", "redis",
+            "RabbitMQ", "rabbitmq",
+            "MinIO", "minio"
     );
+
+    // Base directory inside task containers for artifact files
+    private static final String ARTIFACTS_DIR = "/artifacts";
 
 
     @Autowired
@@ -75,7 +79,27 @@ public class OrchestratorService {
         this.redisTemplate = redisTemplate;
         this.objectMapper = objectMapper;
 
-        ApiClient client = ClientBuilder.cluster().build();
+        ApiClient client;
+        try {
+            // Prefer in-cluster config when running inside Kubernetes (KUBERNETES_SERVICE_HOST is set)
+            String k8sHost = System.getenv("KUBERNETES_SERVICE_HOST");
+            if (k8sHost != null && !k8sHost.isBlank()) {
+                client = ClientBuilder.cluster().build();
+                LOGGER.info("Initialized Kubernetes ApiClient using in-cluster configuration (host={}).", k8sHost);
+            } else {
+                // When running outside a cluster (e.g., docker-compose or local dev), fall back to
+                // the default client which reads ~/.kube/config or KUBECONFIG if available.
+                client = ClientBuilder.defaultClient();
+                LOGGER.warn("KUBERNETES_SERVICE_HOST not set; initialized ApiClient using default kubeconfig. " +
+                        "If no kubeconfig is present, Kubernetes operations may fail.");
+            }
+        } catch (Exception e) {
+            // As a last resort, build a basic ApiClient with no server; log loudly so it’s visible.
+            LOGGER.error("Failed to initialize Kubernetes ApiClient from cluster/default config. " +
+                    "Orchestrator will not be able to talk to Kubernetes. Root cause: {}", e.getMessage(), e);
+            client = new ApiClient();
+        }
+
         client.setReadTimeout(0);
         client.setWriteTimeout(0);
         client.setConnectTimeout(0);
@@ -149,15 +173,14 @@ public class OrchestratorService {
     // --- Start/Stop watchers (Unchanged) ---
     @PostConstruct
     public void startWatchers() {
+        String k8sHost = System.getenv("KUBERNETES_SERVICE_HOST");
+        if (k8sHost == null || k8sHost.isBlank()) {
+            LOGGER.warn("KUBERNETES_SERVICE_HOST not set; skipping Kubernetes watchers in non-cluster environment.");
+            return;
+        }
         LOGGER.info("Starting Kubernetes watchers...");
         informerFactory.startAllRegisteredInformers();
         LOGGER.info("Kubernetes watchers started.");
-    }
-    @PreDestroy
-    public void stopWatchers() {
-        LOGGER.info("Stopping Kubernetes watchers...");
-        informerFactory.stopAllRegisteredInformers(true); // Graceful shutdown
-        LOGGER.info("Kubernetes watchers stopped.");
     }
 
     // --- NEW METHOD: Get System Health Status ---
@@ -382,7 +405,12 @@ public class OrchestratorService {
             long nextAttempt = (currentAttemptStr == null) ? 1 : (Long.parseLong(currentAttemptStr) + 1);
             redisTemplate.opsForValue().set(attemptKey, String.valueOf(nextAttempt));
 
-            V1Job job = createK8sJobDefinition(jobName, dagId, taskNode);
+            // Build artifact mappings (simple convention: outputs are written under /artifacts/<name>,
+            // and inputs with explicit fromTask/name mapping are downloaded to the same path)
+            String inputArtifactsSpec = buildInputArtifactsSpec(dagId, taskNode);
+            String outputArtifactsSpec = buildOutputArtifactsSpec(dagId, taskNode);
+
+            V1Job job = createK8sJobDefinition(jobName, dagId, taskNode, inputArtifactsSpec, outputArtifactsSpec);
             LOGGER.info("Submitting Kubernetes Job '{}' for task '{}' (Attempt {})...", jobName, taskName, nextAttempt);
             V1Job createdJob = batchV1Api.createNamespacedJob(
                     "helios", job, null, null, null, null
@@ -399,6 +427,39 @@ public class OrchestratorService {
             redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "DISPATCH_FAILED");
             handleTaskFailure(dagId, taskName);
         }
+    }
+
+    // Build a semicolon-delimited mapping: name=minioKey;name2=minioKey2
+    private String buildOutputArtifactsSpec(String dagId, JsonNode taskNode) {
+        if (!taskNode.has("outputs") || !taskNode.get("outputs").isArray()) {
+            return "";
+        }
+        String taskName = taskNode.get("name").asText();
+        List<String> specs = new ArrayList<>();
+        for (JsonNode out : taskNode.get("outputs")) {
+            String name = out.asText();
+            String key = String.format("dags/%s/tasks/%s/outputs/%s", dagId, taskName, name);
+            specs.add(name + "=" + key);
+        }
+        return String.join(";", specs);
+    }
+
+    // Inputs expected as array of objects: [{"fromTask":"task1","name":"artifactName"}, ...]
+    private String buildInputArtifactsSpec(String dagId, JsonNode taskNode) {
+        if (!taskNode.has("inputs") || !taskNode.get("inputs").isArray()) {
+            return "";
+        }
+        List<String> specs = new ArrayList<>();
+        for (JsonNode in : taskNode.get("inputs")) {
+            String fromTask = in.path("fromTask").asText(null);
+            String name = in.path("name").asText(null);
+            if (fromTask == null || name == null) {
+                continue;
+            }
+            String key = String.format("dags/%s/tasks/%s/outputs/%s", dagId, fromTask, name);
+            specs.add(name + "=" + key);
+        }
+        return String.join(";", specs);
     }
 
     // --- handleJobCompletion (Unchanged) ---
@@ -594,7 +655,9 @@ public class OrchestratorService {
         return base + "-" + Long.toString(System.nanoTime() % 100000, 36);
     }
 
-    private V1Job createK8sJobDefinition(String jobName, String dagId, JsonNode taskNode) throws IOException {
+    private V1Job createK8sJobDefinition(String jobName, String dagId, JsonNode taskNode,
+                                         String inputArtifactsSpec,
+                                         String outputArtifactsSpec) throws IOException {
         String image = taskNode.get("image").asText();
         List<String> command = objectMapper.convertValue(taskNode.get("command"), new TypeReference<List<String>>() {});
         String taskName = taskNode.get("name").asText();
@@ -610,13 +673,37 @@ public class OrchestratorService {
                 .putLabelsItem("helios-dag-id", cleanDagIdK8s)
                 .putLabelsItem("helios-task-name", cleanTaskNameK8s);
 
+        // Volume for artifact workspace
+        V1Volume artifactsVolume = new V1Volume()
+                .name("artifacts-workdir")
+                .emptyDir(new V1EmptyDirVolumeSource());
+
+        V1VolumeMount artifactsMount = new V1VolumeMount()
+                .name("artifacts-workdir")
+                .mountPath(ARTIFACTS_DIR);
+
         V1Container container = new V1Container()
                 .name(cleanTaskNameK8s.substring(0, Math.min(cleanTaskNameK8s.length(), 50)) + "-cont")
                 .image(image)
-                .command(command);
+                .command(command)
+                .addVolumeMountsItem(artifactsMount)
+                .addEnvItem(new V1EnvVar().name("HELIOS_DAG_ID").value(dagId))
+                .addEnvItem(new V1EnvVar().name("HELIOS_TASK_NAME").value(taskName))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_DIR").value(ARTIFACTS_DIR))
+                .addEnvItem(new V1EnvVar().name("HELIOS_INPUT_ARTIFACTS").value(inputArtifactsSpec))
+                .addEnvItem(new V1EnvVar().name("HELIOS_OUTPUT_ARTIFACTS").value(outputArtifactsSpec))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_ENDPOINT").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_ENDPOINT", "http://minio:9000")))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_BUCKET").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_BUCKET", "helios-artifacts")))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_ACCESS_KEY").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_ACCESS_KEY", "admin")))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_SECRET_KEY").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_SECRET_KEY", "password")));
 
         V1PodSpec podSpec = new V1PodSpec()
                 .restartPolicy("Never")
+                .addVolumesItem(artifactsVolume)
                 .addContainersItem(container);
 
         V1PodTemplateSpec template = new V1PodTemplateSpec()
