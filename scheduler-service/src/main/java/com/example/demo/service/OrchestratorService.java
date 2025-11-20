@@ -72,6 +72,9 @@ public class OrchestratorService {
 
     // Base directory inside task containers for artifact files
     private static final String ARTIFACTS_DIR = "/artifacts";
+    // Node-level cache configuration
+    private static final String CACHE_HOST_PATH = "/var/helios/cache";
+    private static final String CACHE_MOUNT_PATH = "/cache";
 
 
     @Autowired
@@ -347,17 +350,40 @@ public class OrchestratorService {
     // --- End of new method ---
 
 
-    // --- processNewDagSubmission (Unchanged) ---
+    // --- processNewDagSubmission ---
     public String processNewDagSubmission(JsonNode dagPayload) {
         String dagId = "dag-" + UUID.randomUUID();
         try {
+            // Store DAG definition
             redisTemplate.opsForValue().set("dag:" + dagId + ":definition", dagPayload.toString());
+            
+            // Extract and store cache flag
+            boolean useCache = dagPayload.has("useCache") && dagPayload.get("useCache").asBoolean(false);
+            redisTemplate.opsForValue().set("dag:" + dagId + ":useCache", Boolean.toString(useCache));
+            
+            // Initialize metrics
+            String dagName = dagPayload.path("dagName").asText("unknown");
+            long startMillis = System.currentTimeMillis();
+            String metricsKey = "dag:" + dagId + ":metrics";
+            redisTemplate.opsForHash().put(metricsKey, "dagId", dagId);
+            redisTemplate.opsForHash().put(metricsKey, "dagName", dagName);
+            redisTemplate.opsForHash().put(metricsKey, "startTime", Long.toString(startMillis));
+            redisTemplate.opsForHash().put(metricsKey, "status", "RUNNING");
+            redisTemplate.opsForHash().put(metricsKey, "cacheEnabled", Boolean.toString(useCache));
+            
+            // Track this run in the DAG name's list
+            String runsListKey = "dagRuns:" + dagName;
+            redisTemplate.opsForList().leftPush(runsListKey, dagId);
+            redisTemplate.opsForList().trim(runsListKey, 0, 49); // Keep last 50 runs
+            
+            // Initialize task statuses
             dagPayload.get("tasks").forEach(taskNode -> {
                 String taskName = taskNode.get("name").asText();
                 redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "PENDING");
                 redisTemplate.delete(String.format("dag:%s:task:%s:attempts", dagId, taskName));
                 redisTemplate.delete(String.format("dag:%s:task:%s:logs", dagId, taskName));
             });
+            
             evaluateDag(dagId);
         } catch (Exception e) {
             LOGGER.error("Failed to process DAG submission for DAG ID: {}", dagId, e);
@@ -394,7 +420,7 @@ public class OrchestratorService {
                 .allMatch(dependencyNode -> "SUCCEEDED".equals(redisTemplate.opsForValue().get("dag:" + dagId + ":task:" + dependencyNode.asText() + ":status")));
     }
 
-    // --- dispatchTask (v18 pattern - Unchanged) ---
+    // --- dispatchTask ---
     private void dispatchTask(String dagId, JsonNode taskNode) {
         String taskName = taskNode.get("name").asText();
         String jobName = generateK8sJobName(dagId, taskName);
@@ -405,13 +431,19 @@ public class OrchestratorService {
             long nextAttempt = (currentAttemptStr == null) ? 1 : (Long.parseLong(currentAttemptStr) + 1);
             redisTemplate.opsForValue().set(attemptKey, String.valueOf(nextAttempt));
 
-            // Build artifact mappings (simple convention: outputs are written under /artifacts/<name>,
-            // and inputs with explicit fromTask/name mapping are downloaded to the same path)
+            // Build artifact mappings
             String inputArtifactsSpec = buildInputArtifactsSpec(dagId, taskNode);
             String outputArtifactsSpec = buildOutputArtifactsSpec(dagId, taskNode);
+            
+            // Get cache flag for this DAG
+            boolean useCache = Boolean.parseBoolean(
+                redisTemplate.opsForValue().get("dag:" + dagId + ":useCache")
+            );
 
-            V1Job job = createK8sJobDefinition(jobName, dagId, taskNode, inputArtifactsSpec, outputArtifactsSpec);
-            LOGGER.info("Submitting Kubernetes Job '{}' for task '{}' (Attempt {})...", jobName, taskName, nextAttempt);
+            V1Job job = createK8sJobDefinition(jobName, dagId, taskNode, 
+                inputArtifactsSpec, outputArtifactsSpec, useCache);
+            LOGGER.info("Submitting Kubernetes Job '{}' for task '{}' (Attempt {}, Cache: {})...", 
+                jobName, taskName, nextAttempt, useCache);
             V1Job createdJob = batchV1Api.createNamespacedJob(
                     "helios", job, null, null, null, null
             );
@@ -553,8 +585,8 @@ public class OrchestratorService {
     }
 
 
-    // --- handleTaskFailure (Refined logic - Unchanged) ---
-    private void handleTaskFailure(String dagId, String taskName) {
+    // --- handleTaskFailure ---
+    public void handleTaskFailure(String dagId, String taskName) {
         try {
             String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
             if (dagJson == null) { return; }
@@ -637,6 +669,44 @@ public class OrchestratorService {
     }
 
 
+    // --- getDagRunMetrics ---
+    public List<Map<String, Object>> getDagRunMetrics(String dagName, int limit) {
+        String runsListKey = "dagRuns:" + dagName;
+        List<String> dagIds = redisTemplate.opsForList().range(runsListKey, 0, limit - 1);
+        if (dagIds == null || dagIds.isEmpty()) {
+            return Collections.emptyList();
+        }
+        
+        List<Map<String, Object>> runs = new ArrayList<>();
+        for (String dagId : dagIds) {
+            String metricsKey = "dag:" + dagId + ":metrics";
+            Map<Object, Object> raw = redisTemplate.opsForHash().entries(metricsKey);
+            if (raw == null || raw.isEmpty()) continue;
+            
+            Map<String, Object> run = raw.entrySet().stream()
+                    .collect(Collectors.toMap(e -> e.getKey().toString(), Map.Entry::getValue));
+            run.put("dagId", dagId);
+            
+            // Calculate duration if completed
+            if (run.containsKey("endTime") && run.containsKey("startTime")) {
+                long duration = Long.parseLong(run.get("endTime").toString()) - 
+                               Long.parseLong(run.get("startTime").toString());
+                run.put("duration", duration);
+            }
+            
+            runs.add(run);
+        }
+        
+        // Sort by startTime descending (most recent first)
+        runs.sort((a, b) -> {
+            long sa = Long.parseLong(String.valueOf(a.getOrDefault("startTime", "0")));
+            long sb = Long.parseLong(String.valueOf(b.getOrDefault("startTime", "0")));
+            return Long.compare(sb, sa);
+        });
+        
+        return runs;
+    }
+
     // --- HELPER METHODS (Unchanged) ---
     private JsonNode findTaskNode(JsonNode dagPayload, String taskName) {
         for (JsonNode task : dagPayload.get("tasks")) {
@@ -657,7 +727,8 @@ public class OrchestratorService {
 
     private V1Job createK8sJobDefinition(String jobName, String dagId, JsonNode taskNode,
                                          String inputArtifactsSpec,
-                                         String outputArtifactsSpec) throws IOException {
+                                         String outputArtifactsSpec,
+                                         boolean useCache) throws IOException {
         String image = taskNode.get("image").asText();
         List<String> command = objectMapper.convertValue(taskNode.get("command"), new TypeReference<List<String>>() {});
         String taskName = taskNode.get("name").asText();
@@ -682,28 +753,86 @@ public class OrchestratorService {
                 .name("artifacts-workdir")
                 .mountPath(ARTIFACTS_DIR);
 
+        // Cache volume (HostPath)
+        V1Volume cacheVolume = new V1Volume()
+                .name("artifact-cache")
+                .hostPath(new V1HostPathVolumeSource()
+                        .path(CACHE_HOST_PATH)
+                        .type("DirectoryOrCreate"));
+
+        V1VolumeMount cacheMount = new V1VolumeMount()
+                .name("artifact-cache")
+                .mountPath(CACHE_MOUNT_PATH);
+
+        // Common environment variables shared by init and main container
+        List<V1EnvVar> commonEnv = Arrays.asList(
+                new V1EnvVar().name("HELIOS_DAG_ID").value(dagId),
+                new V1EnvVar().name("HELIOS_TASK_NAME").value(taskName),
+                new V1EnvVar().name("HELIOS_ARTIFACTS_DIR").value(ARTIFACTS_DIR),
+                new V1EnvVar().name("HELIOS_CACHE_DIR").value(CACHE_MOUNT_PATH),
+                new V1EnvVar().name("HELIOS_INPUT_ARTIFACTS").value(inputArtifactsSpec),
+                new V1EnvVar().name("HELIOS_OUTPUT_ARTIFACTS").value(outputArtifactsSpec),
+                new V1EnvVar().name("HELIOS_ARTIFACTS_ENDPOINT")
+                        .value(System.getenv().getOrDefault("HELIOS_ARTIFACTS_ENDPOINT", "http://minio:9000")),
+                new V1EnvVar().name("HELIOS_ARTIFACTS_BUCKET")
+                        .value(System.getenv().getOrDefault("HELIOS_ARTIFACTS_BUCKET", "helios-artifacts")),
+                new V1EnvVar().name("HELIOS_ARTIFACTS_ACCESS_KEY")
+                        .value(System.getenv().getOrDefault("HELIOS_ARTIFACTS_ACCESS_KEY", "admin")),
+                new V1EnvVar().name("HELIOS_ARTIFACTS_SECRET_KEY")
+                        .value(System.getenv().getOrDefault("HELIOS_ARTIFACTS_SECRET_KEY", "password")),
+                new V1EnvVar().name("HELIOS_CACHE_ENABLED").value(Boolean.toString(useCache))
+        );
+
+        // Init container with smart downloader logic
+        String initScript = 
+            "set -e\n" +
+            "echo '[HELIOS] Init container starting for task ' \"$HELIOS_TASK_NAME\"\n" +
+            "IFS=';' read -ra PAIRS <<< \"$HELIOS_INPUT_ARTIFACTS\"\n" +
+            "for pair in \"${PAIRS[@]}\"; do\n" +
+            "  [ -z \"$pair\" ] && continue\n" +
+            "  name=\"${pair%%=*}\"\n" +
+            "  key=\"${pair#*=}\"\n" +
+            "  fileName=\"$(basename \"$key\")\"\n" +
+            "  workspacePath=\"$HELIOS_ARTIFACTS_DIR/$name\"\n" +
+            "  cachePath=\"$HELIOS_CACHE_DIR/$HELIOS_DAG_ID/$name/$fileName\"\n" +
+            "  mkdir -p \"$(dirname \"$cachePath\")\" \"$(dirname \"$workspacePath\")\"\n" +
+            "  if [ \"$HELIOS_CACHE_ENABLED\" = 'true' ] && [ -f \"$cachePath\" ]; then\n" +
+            "    echo '[HELIOS] Cache hit for ' \"$key\" ' -> ' \"$cachePath\"\n" +
+            "    cp -f \"$cachePath\" \"$workspacePath\"\n" +
+            "    continue\n" +
+            "  fi\n" +
+            "  echo '[HELIOS] Cache miss for ' \"$key\" '; downloading from MinIO...'\n" +
+            "  tmpFile=\"$cachePath.tmp\"\n" +
+            "  rm -f \"$tmpFile\"\n" +
+            "  wget --quiet --show-progress --timeout=30 --tries=3 --header=\"Host: minio\" \\\n" +
+            "    \"$HELIOS_ARTIFACTS_ENDPOINT/$HELIOS_ARTIFACTS_BUCKET/$key\" -O \"$tmpFile\" || {\n" +
+            "      echo '[HELIOS] ERROR: Download failed for ' \"$key\" ; exit 1; }\n" +
+            "  mv \"$tmpFile\" \"$cachePath\"\n" +
+            "  cp -f \"$cachePath\" \"$workspacePath\"\n" +
+            "done\n" +
+            "echo '[HELIOS] Init container completed.'";
+
+        V1Container initContainer = new V1Container()
+                .name("artifact-downloader")
+                .image("busybox:latest")
+                .command(Arrays.asList("/bin/sh", "-c", initScript))
+                .addVolumeMountsItem(artifactsMount)
+                .addVolumeMountsItem(cacheMount)
+                .env(commonEnv);
+
         V1Container container = new V1Container()
                 .name(cleanTaskNameK8s.substring(0, Math.min(cleanTaskNameK8s.length(), 50)) + "-cont")
                 .image(image)
                 .command(command)
                 .addVolumeMountsItem(artifactsMount)
-                .addEnvItem(new V1EnvVar().name("HELIOS_DAG_ID").value(dagId))
-                .addEnvItem(new V1EnvVar().name("HELIOS_TASK_NAME").value(taskName))
-                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_DIR").value(ARTIFACTS_DIR))
-                .addEnvItem(new V1EnvVar().name("HELIOS_INPUT_ARTIFACTS").value(inputArtifactsSpec))
-                .addEnvItem(new V1EnvVar().name("HELIOS_OUTPUT_ARTIFACTS").value(outputArtifactsSpec))
-                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_ENDPOINT").value(
-                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_ENDPOINT", "http://minio:9000")))
-                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_BUCKET").value(
-                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_BUCKET", "helios-artifacts")))
-                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_ACCESS_KEY").value(
-                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_ACCESS_KEY", "admin")))
-                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_SECRET_KEY").value(
-                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_SECRET_KEY", "password")));
+                .addVolumeMountsItem(cacheMount)
+                .env(commonEnv);
 
         V1PodSpec podSpec = new V1PodSpec()
                 .restartPolicy("Never")
                 .addVolumesItem(artifactsVolume)
+                .addVolumesItem(cacheVolume)
+                .addInitContainersItem(initContainer)
                 .addContainersItem(container);
 
         V1PodTemplateSpec template = new V1PodTemplateSpec()

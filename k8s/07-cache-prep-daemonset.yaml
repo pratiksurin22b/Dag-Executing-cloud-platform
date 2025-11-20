@@ -1,0 +1,56 @@
+# 07-cache-prep-daemonset.yaml
+# DaemonSet to automatically create and configure the cache directory on each node
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: helios-cache-prep
+  namespace: helios
+  labels:
+    app: helios-cache-prep
+spec:
+  selector:
+    matchLabels:
+      app: helios-cache-prep
+  template:
+    metadata:
+      labels:
+        app: helios-cache-prep
+    spec:
+      # Tolerate control-plane taints so it runs on all nodes
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      hostNetwork: true
+      hostPID: true
+      containers:
+        - name: cache-prep
+          image: busybox:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "[HELIOS] Preparing cache directory on node..."
+              mkdir -p /host/var/helios/cache
+              chmod 777 /host/var/helios/cache
+              echo "[HELIOS] Cache directory ready at /var/helios/cache"
+              echo "[HELIOS] Keeping DaemonSet pod running..."
+              tail -f /dev/null
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "50m"
+              memory: "64Mi"
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
