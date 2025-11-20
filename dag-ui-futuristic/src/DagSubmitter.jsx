@@ -1,7 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import jsyaml from 'js-yaml';
-// Import the new icon for the skipped/failed upstream status
-import { Edit3, CheckCircle, XCircle, Loader, Clock, GitBranch, AlertTriangle } from 'lucide-react';
+import { Edit3, CheckCircle, XCircle, Loader, Clock, GitBranch, AlertTriangle, TrendingUp, Database } from 'lucide-react';
 
 const sampleYaml = `apiVersion: v1
 dagName: "guaranteed-failure-test"
@@ -63,11 +62,13 @@ const TaskItem = ({ task }) => (
 );
 
 const DagMonitor = () => {
-    // All state hooks and functions (useEffect, handleSubmit) are the same as before.
     const [yamlText, setYamlText] = useState(sampleYaml);
     const [dagState, setDagState] = useState(null);
     const [error, setError] = useState('');
     const [isSubmitting, setIsSubmitting] = useState(false);
+    const [useCache, setUseCache] = useState(true);
+    const [metrics, setMetrics] = useState([]);
+    const [showMetrics, setShowMetrics] = useState(false);
     const pollingIntervalRef = useRef(null);
 
     useEffect(() => {
@@ -97,12 +98,26 @@ const DagMonitor = () => {
         };
     }, [dagState?.dagId]);
 
+    const fetchMetrics = async (dagName) => {
+        try {
+            const response = await fetch(`${apiUrl}/${encodeURIComponent(dagName)}/metrics?limit=20`);
+            if (response.ok) {
+                const data = await response.json();
+                setMetrics(data);
+                setShowMetrics(true);
+            }
+        } catch (e) {
+            console.error("Failed to fetch metrics:", e);
+        }
+    };
+
     const handleSubmit = async () => {
         setIsSubmitting(true);
         setError('');
         setDagState(null);
         try {
             const dagObject = jsyaml.load(yamlText);
+            dagObject.useCache = useCache;
             const apiResponse = await fetch(apiUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -117,6 +132,11 @@ const DagMonitor = () => {
                 logs: []
             }));
             setDagState({ dagId: result.dagId, dagName: dagObject.dagName, tasks: initialTasks });
+            
+            // Auto-fetch metrics for this DAG
+            if (dagObject.dagName) {
+                setTimeout(() => fetchMetrics(dagObject.dagName), 1000);
+            }
         } catch (err) {
             setError(err.message);
         } finally {
@@ -124,12 +144,53 @@ const DagMonitor = () => {
         }
     };
 
+    const summarizeMetrics = (runs) => {
+        const cached = runs.filter(r => String(r.cacheEnabled) === 'true');
+        const nonCached = runs.filter(r => String(r.cacheEnabled) !== 'true');
+        const avg = arr => arr.length
+            ? arr.reduce((s, r) => s + Number(r.durationMs || 0), 0) / arr.length
+            : 0;
+        return {
+            cachedCount: cached.length,
+            nonCachedCount: nonCached.length,
+            cachedAvgMs: Math.round(avg(cached)),
+            nonCachedAvgMs: Math.round(avg(nonCached)),
+        };
+    };
+
+    const computeLoadFactor = (run) => {
+        const total = Number(run.taskCount || 0);
+        const succ = Number(run.taskSucceeded || 0);
+        const failed = Number(run.taskFailed || 0) + Number(run.taskUpstreamFailed || 0);
+        if (!total) return '-';
+        return `${succ}/${total} ok, ${failed} failed`;
+    };
+
+    const formatNodes = (nodesStr) => {
+        if (!nodesStr) return '-';
+        return String(nodesStr).split(',').filter(Boolean).join(', ');
+    };
+
+    const summary = summarizeMetrics(metrics);
+
     return (
         <div style={styles.container}>
             <div style={styles.panel}>
                 <h1 style={styles.title}>DAG Orchestration Terminal</h1>
                 <div style={styles.editorContainer}>
                     <textarea style={styles.textArea} value={yamlText} onChange={(e) => setYamlText(e.target.value)} />
+                </div>
+                <div style={styles.toggleRow}>
+                    <label style={styles.toggleLabel}>
+                        <input
+                            type="checkbox"
+                            checked={useCache}
+                            onChange={e => setUseCache(e.target.checked)}
+                            style={styles.checkbox}
+                        />
+                        <Database size={16} style={{ marginLeft: '8px', marginRight: '4px' }} />
+                        <span>Enable node-level cache for this run</span>
+                    </label>
                 </div>
                 <button style={styles.submitButton} onClick={handleSubmit} disabled={isSubmitting}>
                     {isSubmitting ? 'Submitting...' : 'Initiate Workflow'}
@@ -145,18 +206,73 @@ const DagMonitor = () => {
                      </div>
                  </div>
             )}
+            {showMetrics && metrics.length > 0 && (
+                <div style={{...styles.panel, marginTop: '20px'}}>
+                    <h2 style={styles.title}><TrendingUp size={24} style={{ display: 'inline', marginRight: '8px' }} />Run Metrics</h2>
+                    <div style={styles.summaryCards}>
+                        <div style={styles.summaryCard}>
+                            <div style={styles.summaryCardTitle}>Cached Runs</div>
+                            <div style={styles.summaryCardValue}>{summary.cachedCount}</div>
+                            <div style={styles.summaryCardSubtext}>Avg: {(summary.cachedAvgMs / 1000).toFixed(2)}s</div>
+                        </div>
+                        <div style={styles.summaryCard}>
+                            <div style={styles.summaryCardTitle}>Non-Cached Runs</div>
+                            <div style={styles.summaryCardValue}>{summary.nonCachedCount}</div>
+                            <div style={styles.summaryCardSubtext}>Avg: {(summary.nonCachedAvgMs / 1000).toFixed(2)}s</div>
+                        </div>
+                        {metrics.length > 0 && (
+                            <div style={styles.summaryCard}>
+                                <div style={styles.summaryCardTitle}>Last Run Load</div>
+                                <div style={styles.summaryCardValue}>{computeLoadFactor(metrics[0])}</div>
+                                <div style={styles.summaryCardSubtext}>Task distribution</div>
+                            </div>
+                        )}
+                    </div>
+                    <div style={styles.metricsTable}>
+                        <table style={styles.table}>
+                            <thead>
+                                <tr>
+                                    <th style={styles.th}>Run ID</th>
+                                    <th style={styles.th}>Start Time</th>
+                                    <th style={styles.th}>Duration (s)</th>
+                                    <th style={styles.th}>Cache Enabled</th>
+                                    <th style={styles.th}>Cache Hit</th>
+                                    <th style={styles.th}>Status</th>
+                                    <th style={styles.th}>Tasks</th>
+                                    <th style={styles.th}>Nodes</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {metrics.map((run, idx) => (
+                                    <tr key={idx} style={styles.tr}>
+                                        <td style={styles.td}>{String(run.dagId).substring(0, 12)}...</td>
+                                        <td style={styles.td}>{new Date(Number(run.startTime)).toLocaleString()}</td>
+                                        <td style={styles.td}>{run.durationMs ? (Number(run.durationMs) / 1000).toFixed(2) : 'Running'}</td>
+                                        <td style={styles.td}>{String(run.cacheEnabled) === 'true' ? '✓' : '✗'}</td>
+                                        <td style={styles.td}>{run.cacheHit || 'N/A'}</td>
+                                        <td style={{...styles.td, ...styles.statusColors[run.status]}}>{run.status}</td>
+                                        <td style={styles.td}>{computeLoadFactor(run)}</td>
+                                        <td style={styles.td}>{formatNodes(run.nodes)}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            )}
         </div>
     );
 };
 
-// Updated styles to add specific colors for the status text
 const styles = {
-    // ... all other styles are the same
     container: { width: '90%', margin: '0 auto', fontFamily: 'Arial, sans-serif', padding: '20px 0' },
     panel: { width: '100%', maxWidth: '900px', backgroundColor: '#101827', border: '1px solid #00f5ff', borderRadius: '8px', padding: '30px', boxShadow: '0 0 25px rgba(0, 245, 255, 0.3)', margin: '0 auto' },
     title: { color: '#00f5ff', textAlign: 'center', margin: '0 0 20px 0' },
     editorContainer: { marginBottom: '20px' },
     textArea: { width: '100%', height: '250px', backgroundColor: '#0a0f18', border: '1px solid #334155', color: '#e0e0e0', borderRadius: '4px', padding: '15px', fontFamily: 'monospace', fontSize: '14px', boxSizing: 'border-box' },
+    toggleRow: { marginBottom: '20px', display: 'flex', justifyContent: 'center' },
+    toggleLabel: { display: 'flex', alignItems: 'center', color: '#00f5ff', fontSize: '16px', cursor: 'pointer' },
+    checkbox: { width: '18px', height: '18px', cursor: 'pointer' },
     submitButton: { width: '100%', background: '#00f5ff', border: 'none', color: '#0a0f18', padding: '15px', borderRadius: '4px', fontSize: '18px', fontWeight: 'bold', cursor: 'pointer', transition: 'opacity 0.2s' },
     errorBox: { marginTop: '15px', padding: '10px', backgroundColor: '#ff4d4d20', border: '1px solid #ff4d4d', color: 'white', borderRadius: '4px', fontFamily: 'monospace' },
     dagId: { color: '#94a3b8', textAlign: 'center', marginBottom: '20px', wordBreak: 'break-all', fontSize: '14px' },
@@ -171,9 +287,20 @@ const styles = {
         QUEUED: { color: '#00f5ff' },
         PENDING: { color: '#94a3b8' },
         UPSTREAM_FAILED: { color: '#f59e0b' },
+        RUNNING: { color: '#00f5ff' },
     },
     dependencies: { display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontSize: '12px', marginBottom: '10px', paddingLeft: '5px' },
     logs: { backgroundColor: '#0a0f18', padding: '10px', borderRadius: '4px', fontFamily: 'monospace', fontSize: '12px', color: '#e0e0e0', whiteSpace: 'pre-wrap', maxHeight: '150px', overflowY: 'auto', border: '1px solid #334155' },
+    summaryCards: { display: 'flex', gap: '15px', marginBottom: '20px', flexWrap: 'wrap' },
+    summaryCard: { flex: 1, minWidth: '200px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '8px', padding: '20px', textAlign: 'center' },
+    summaryCardTitle: { color: '#94a3b8', fontSize: '14px', marginBottom: '10px' },
+    summaryCardValue: { color: '#00f5ff', fontSize: '32px', fontWeight: 'bold', marginBottom: '5px' },
+    summaryCardSubtext: { color: '#64748b', fontSize: '12px' },
+    metricsTable: { overflowX: 'auto' },
+    table: { width: '100%', borderCollapse: 'collapse', color: '#e0e0e0', fontSize: '14px' },
+    th: { backgroundColor: '#1e293b', padding: '12px', textAlign: 'left', borderBottom: '2px solid #334155', color: '#00f5ff', fontWeight: 'bold' },
+    td: { padding: '10px', borderBottom: '1px solid #334155' },
+    tr: { transition: 'background-color 0.2s', cursor: 'default' },
 };
 
 export default DagMonitor;
