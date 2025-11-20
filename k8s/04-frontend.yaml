@@ -19,8 +19,8 @@ spec:
     spec:
       containers:
         - name: frontend
-          # Updated to new tag including health endpoint changes
-          image: pratik9634/frontend:healthfix
+          # Updated to new tag including Phase 2 caching UI
+          image: pratik9634/frontend:cache
           imagePullPolicy: Always
           ports:
             - containerPort: 80
