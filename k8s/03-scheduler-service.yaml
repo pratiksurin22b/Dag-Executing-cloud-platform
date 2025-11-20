@@ -19,8 +19,8 @@ spec:
       serviceAccountName: helios-scheduler-sa
       containers:
         - name: scheduler-service
-          # Updated to match the latest pushed image tag
-          image: pratik9634/scheduler-service:healthfix
+          # Updated to match the latest pushed image tag with Phase 2 caching
+          image: pratik9634/scheduler-service:cache
           imagePullPolicy: Always
           ports:
             - containerPort: 8080

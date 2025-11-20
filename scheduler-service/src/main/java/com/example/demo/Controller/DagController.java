@@ -67,4 +67,17 @@ public class DagController {
             return ResponseEntity.internalServerError().body(response);
         }
     }
+
+    @GetMapping("/dags/{dagName}/metrics")
+    public ResponseEntity<Object> getDagMetrics(
+            @PathVariable String dagName,
+            @RequestParam(defaultValue = "20") int limit) {
+        try {
+            var metrics = orchestratorService.getDagRunMetrics(dagName, limit);
+            return ResponseEntity.ok(metrics);
+        } catch (Exception e) {
+            LOGGER.error("Failed to get metrics for DAG: {}", dagName, e);
+            return ResponseEntity.internalServerError().build();
+        }
+    }
 }

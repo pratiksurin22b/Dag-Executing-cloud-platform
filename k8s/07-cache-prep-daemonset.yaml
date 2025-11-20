@@ -1,0 +1,45 @@
+# 07-cache-prep-daemonset.yaml
+# DaemonSet to prepare /var/helios/cache on every node for artifact caching
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: helios-cache-prep
+  namespace: helios
+  labels:
+    app: helios-cache-prep
+spec:
+  selector:
+    matchLabels:
+      app: helios-cache-prep
+  template:
+    metadata:
+      labels:
+        app: helios-cache-prep
+    spec:
+      tolerations:
+        # This allows the DaemonSet to run on all nodes, including control-plane nodes
+        - operator: "Exists"
+      containers:
+        - name: cache-prep
+          image: alpine:3.19
+          securityContext:
+            privileged: true
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "[HELIOS] Preparing /var/helios/cache on host..."
+              mkdir -p /host/var/helios/cache
+              chmod 777 /host/var/helios/cache
+              echo "[HELIOS] /var/helios/cache prepared on host $(hostname)."
+              # Keep container running
+              tail -f /dev/null
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory

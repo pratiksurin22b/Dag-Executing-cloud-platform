@@ -72,6 +72,10 @@ public class OrchestratorService {
 
     // Base directory inside task containers for artifact files
     private static final String ARTIFACTS_DIR = "/artifacts";
+    // Host path for node-level artifact cache
+    private static final String CACHE_HOST_PATH = "/var/helios/cache";
+    // Mount path for cache inside containers
+    private static final String CACHE_MOUNT_PATH = "/cache";
 
 
     @Autowired
@@ -347,11 +351,37 @@ public class OrchestratorService {
     // --- End of new method ---
 
 
-    // --- processNewDagSubmission (Unchanged) ---
+    // --- processNewDagSubmission - Enhanced with caching and metrics ---
     public String processNewDagSubmission(JsonNode dagPayload) {
         String dagId = "dag-" + UUID.randomUUID();
         try {
+            String dagName = dagPayload.path("dagName").asText("unknown-dag");
+            boolean useCache = dagPayload.has("useCache") && dagPayload.get("useCache").asBoolean(false);
+            
             redisTemplate.opsForValue().set("dag:" + dagId + ":definition", dagPayload.toString());
+            redisTemplate.opsForValue().set("dag:" + dagId + ":useCache", Boolean.toString(useCache));
+            
+            // Initialize metrics for this DAG run
+            String metricsKey = "dag:" + dagId + ":metrics";
+            long startMillis = System.currentTimeMillis();
+            redisTemplate.opsForHash().put(metricsKey, "dagId", dagId);
+            redisTemplate.opsForHash().put(metricsKey, "dagName", dagName);
+            redisTemplate.opsForHash().put(metricsKey, "startTime", Long.toString(startMillis));
+            redisTemplate.opsForHash().put(metricsKey, "status", "RUNNING");
+            redisTemplate.opsForHash().put(metricsKey, "cacheEnabled", Boolean.toString(useCache));
+            redisTemplate.opsForHash().put(metricsKey, "taskCount", Integer.toString(dagPayload.path("tasks").size()));
+            redisTemplate.opsForHash().put(metricsKey, "taskSucceeded", "0");
+            redisTemplate.opsForHash().put(metricsKey, "taskFailed", "0");
+            redisTemplate.opsForHash().put(metricsKey, "taskUpstreamFailed", "0");
+            redisTemplate.opsForHash().put(metricsKey, "cacheHitTasks", "0");
+            redisTemplate.opsForHash().put(metricsKey, "cacheMissTasks", "0");
+            redisTemplate.opsForHash().put(metricsKey, "nodes", "");
+            
+            // Track this run in the DAG's run history
+            String runsListKey = "dagRuns:" + dagName;
+            redisTemplate.opsForList().leftPush(runsListKey, dagId);
+            redisTemplate.opsForList().trim(runsListKey, 0, 99); // Keep last 100 runs
+            
             dagPayload.get("tasks").forEach(taskNode -> {
                 String taskName = taskNode.get("name").asText();
                 redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "PENDING");
@@ -394,7 +424,7 @@ public class OrchestratorService {
                 .allMatch(dependencyNode -> "SUCCEEDED".equals(redisTemplate.opsForValue().get("dag:" + dagId + ":task:" + dependencyNode.asText() + ":status")));
     }
 
-    // --- dispatchTask (v18 pattern - Unchanged) ---
+    // --- dispatchTask - Enhanced with cache support ---
     private void dispatchTask(String dagId, JsonNode taskNode) {
         String taskName = taskNode.get("name").asText();
         String jobName = generateK8sJobName(dagId, taskName);
@@ -409,9 +439,15 @@ public class OrchestratorService {
             // and inputs with explicit fromTask/name mapping are downloaded to the same path)
             String inputArtifactsSpec = buildInputArtifactsSpec(dagId, taskNode);
             String outputArtifactsSpec = buildOutputArtifactsSpec(dagId, taskNode);
+            
+            // Get cache setting for this DAG
+            boolean useCache = Boolean.parseBoolean(
+                redisTemplate.opsForValue().get("dag:" + dagId + ":useCache")
+            );
 
-            V1Job job = createK8sJobDefinition(jobName, dagId, taskNode, inputArtifactsSpec, outputArtifactsSpec);
-            LOGGER.info("Submitting Kubernetes Job '{}' for task '{}' (Attempt {})...", jobName, taskName, nextAttempt);
+            V1Job job = createK8sJobDefinition(jobName, dagId, taskNode, inputArtifactsSpec, outputArtifactsSpec, useCache);
+            LOGGER.info("Submitting Kubernetes Job '{}' for task '{}' (Attempt {}, Cache={})...", 
+                jobName, taskName, nextAttempt, useCache);
             V1Job createdJob = batchV1Api.createNamespacedJob(
                     "helios", job, null, null, null, null
             );
@@ -528,13 +564,23 @@ public class OrchestratorService {
     }
 
 
-    // --- processJobResult (Refined logic - Unchanged) ---
+    // --- processJobResult - Enhanced with metrics tracking ---
     private void processJobResult(String dagId, String taskName, boolean success, String logs) {
         try {
             String taskStatusKey = String.format("dag:%s:task:%s:status", dagId, taskName);
             String taskLogsKey = String.format("dag:%s:task:%s:logs", dagId, taskName);
             List<String> logList = (logs != null && !logs.startsWith("Error:")) ? List.of(logs.split("\n")) : List.of(logs);
             redisTemplate.opsForValue().set(taskLogsKey, objectMapper.writeValueAsString(logList));
+            
+            // Track cache hits/misses from logs
+            if (logs != null && logs.contains("[HELIOS] Cache hit")) {
+                String metricsKey = "dag:" + dagId + ":metrics";
+                redisTemplate.opsForHash().increment(metricsKey, "cacheHitTasks", 1);
+            } else if (logs != null && logs.contains("[HELIOS] Cache miss")) {
+                String metricsKey = "dag:" + dagId + ":metrics";
+                redisTemplate.opsForHash().increment(metricsKey, "cacheMissTasks", 1);
+            }
+            
             String currentStatus = redisTemplate.opsForValue().get(taskStatusKey);
             if ("SUCCEEDED".equals(currentStatus) || "FAILED".equals(currentStatus) || "UPSTREAM_FAILED".equals(currentStatus)) {
                 LOGGER.warn("Task '{}' already in final state '{}'. Ignoring job completion event.", taskName, currentStatus);
@@ -542,7 +588,11 @@ public class OrchestratorService {
             }
             if (success) {
                 redisTemplate.opsForValue().set(taskStatusKey, "SUCCEEDED");
+                // Update metrics
+                String metricsKey = "dag:" + dagId + ":metrics";
+                redisTemplate.opsForHash().increment(metricsKey, "taskSucceeded", 1);
                 LOGGER.info("Task '{}' SUCCEEDED. Triggering DAG re-evaluation.", taskName);
+                finalizeDagMetricsIfComplete(dagId);
                 evaluateDag(dagId);
             } else {
                 handleTaskFailure(dagId, taskName);
@@ -553,7 +603,7 @@ public class OrchestratorService {
     }
 
 
-    // --- handleTaskFailure (Refined logic - Unchanged) ---
+    // --- handleTaskFailure - Enhanced with metrics tracking ---
     private void handleTaskFailure(String dagId, String taskName) {
         try {
             String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
@@ -573,6 +623,10 @@ public class OrchestratorService {
                 } else { // This means attemptsMade == maxRetries + 1, which was the final attempt
                     LOGGER.error("Task '{}' FAILED on final attempt {}. Initiating failure propagation.", taskName, attemptsMade -1); // Log the attempt number that failed
                     redisTemplate.opsForValue().set(String.format("dag:%s:task:%s:status", dagId, taskName), "FAILED");
+                    // Update metrics
+                    String metricsKey = "dag:" + dagId + ":metrics";
+                    redisTemplate.opsForHash().increment(metricsKey, "taskFailed", 1);
+                    finalizeDagMetricsIfComplete(dagId);
                     propagateFailure(dagId, taskName);
                 }
             }
@@ -581,7 +635,7 @@ public class OrchestratorService {
         }
     }
 
-    // --- propagateFailure (Refined logic - Unchanged) ---
+    // --- propagateFailure - Enhanced with metrics tracking ---
     public void propagateFailure(String dagId, String failedTaskName) {
         try {
             String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
@@ -596,7 +650,11 @@ public class OrchestratorService {
                             String currentChildStatus = redisTemplate.opsForValue().get(childStatusKey);
                             if ("PENDING".equals(currentChildStatus)) {
                                 redisTemplate.opsForValue().set(childStatusKey, "UPSTREAM_FAILED");
+                                // Update metrics
+                                String metricsKey = "dag:" + dagId + ":metrics";
+                                redisTemplate.opsForHash().increment(metricsKey, "taskUpstreamFailed", 1);
                                 LOGGER.warn("Propagating failure: Task '{}' marked as UPSTREAM_FAILED.", childTaskName);
+                                finalizeDagMetricsIfComplete(dagId);
                                 propagateFailure(dagId, childTaskName);
                             }
                         }
@@ -606,6 +664,102 @@ public class OrchestratorService {
         } catch (IOException e) {
             LOGGER.error("Failed to read DAG definition during failure propagation for DAG ID: {}", dagId, e);
         }
+    }
+
+    // --- finalizeDagMetricsIfComplete - Check if DAG is complete and update metrics ---
+    private void finalizeDagMetricsIfComplete(String dagId) {
+        try {
+            String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
+            if (dagJson == null) { return; }
+            JsonNode dagPayload = objectMapper.readTree(dagJson);
+            
+            boolean allTerminal = true;
+            boolean anyFailed = false;
+            Set<String> nodes = new HashSet<>();
+            
+            for (JsonNode taskNode : dagPayload.get("tasks")) {
+                String taskName = taskNode.get("name").asText();
+                String status = redisTemplate.opsForValue().get("dag:" + dagId + ":task:" + taskName + ":status");
+                
+                if (status == null || "PENDING".equals(status) || "K8S_JOB_CREATING".equals(status) || 
+                    "K8S_JOB_SUBMITTED".equals(status) || "QUEUED".equals(status)) {
+                    allTerminal = false;
+                    break;
+                }
+                
+                if ("FAILED".equals(status) || "UPSTREAM_FAILED".equals(status)) {
+                    anyFailed = true;
+                }
+                
+                // Try to extract node information from logs or job metadata
+                // For now, we'll track it when we have pod information
+            }
+            
+            if (allTerminal) {
+                String metricsKey = "dag:" + dagId + ":metrics";
+                long endMillis = System.currentTimeMillis();
+                String startTimeStr = (String) redisTemplate.opsForHash().get(metricsKey, "startTime");
+                long startMillis = startTimeStr != null ? Long.parseLong(startTimeStr) : endMillis;
+                long durationMs = endMillis - startMillis;
+                
+                redisTemplate.opsForHash().put(metricsKey, "endTime", Long.toString(endMillis));
+                redisTemplate.opsForHash().put(metricsKey, "durationMs", Long.toString(durationMs));
+                redisTemplate.opsForHash().put(metricsKey, "status", anyFailed ? "FAILED" : "SUCCEEDED");
+                
+                // Determine cache hit status
+                String cacheHitTasksStr = (String) redisTemplate.opsForHash().get(metricsKey, "cacheHitTasks");
+                String cacheMissTasksStr = (String) redisTemplate.opsForHash().get(metricsKey, "cacheMissTasks");
+                int cacheHits = cacheHitTasksStr != null ? Integer.parseInt(cacheHitTasksStr) : 0;
+                int cacheMisses = cacheMissTasksStr != null ? Integer.parseInt(cacheMissTasksStr) : 0;
+                
+                String cacheHitStatus = "N/A";
+                if (cacheHits > 0 && cacheMisses == 0) {
+                    cacheHitStatus = "Hit";
+                } else if (cacheHits > 0 && cacheMisses > 0) {
+                    cacheHitStatus = "Partial";
+                } else if (cacheMisses > 0) {
+                    cacheHitStatus = "Miss";
+                }
+                redisTemplate.opsForHash().put(metricsKey, "cacheHit", cacheHitStatus);
+                
+                LOGGER.info("DAG '{}' completed with status: {}, duration: {}ms", dagId, 
+                    anyFailed ? "FAILED" : "SUCCEEDED", durationMs);
+            }
+        } catch (Exception e) {
+            LOGGER.error("Failed to finalize metrics for DAG '{}'", dagId, e);
+        }
+    }
+    
+    // --- getDagRunMetrics - Get historical metrics for a DAG ---
+    public List<Map<String, Object>> getDagRunMetrics(String dagName, int limit) {
+        String runsListKey = "dagRuns:" + dagName;
+        List<String> dagIds = redisTemplate.opsForList().range(runsListKey, 0, limit - 1);
+        if (dagIds == null || dagIds.isEmpty()) {
+            return Collections.emptyList();
+        }
+        
+        List<Map<String, Object>> runs = new ArrayList<>();
+        for (String dagId : dagIds) {
+            String metricsKey = "dag:" + dagId + ":metrics";
+            Map<Object, Object> raw = redisTemplate.opsForHash().entries(metricsKey);
+            if (raw == null || raw.isEmpty()) {
+                continue;
+            }
+            
+            Map<String, Object> run = raw.entrySet().stream()
+                .collect(Collectors.toMap(e -> e.getKey().toString(), Map.Entry::getValue));
+            run.put("dagId", dagId);
+            runs.add(run);
+        }
+        
+        // Sort by start time, newest first
+        runs.sort((a, b) -> {
+            long sa = Long.parseLong(String.valueOf(a.getOrDefault("startTime", "0")));
+            long sb = Long.parseLong(String.valueOf(b.getOrDefault("startTime", "0")));
+            return Long.compare(sb, sa);
+        });
+        
+        return runs;
     }
 
     // --- getDagStatus (Unchanged) ---
@@ -655,9 +809,40 @@ public class OrchestratorService {
         return base + "-" + Long.toString(System.nanoTime() % 100000, 36);
     }
 
+    private String buildInitContainerScript() {
+        return "set -e\n" +
+               "apk add --no-cache wget ca-certificates\n" +
+               "echo '[HELIOS] Init container starting for task ' \"$HELIOS_TASK_NAME\"\n" +
+               "IFS=';' read -ra PAIRS <<< \"$HELIOS_INPUT_ARTIFACTS\"\n" +
+               "for pair in \"${PAIRS[@]}\"; do\n" +
+               "  [ -z \"$pair\" ] && continue\n" +
+               "  name=\"${pair%%=*}\"\n" +
+               "  key=\"${pair#*=}\"\n" +
+               "  fileName=\"$(basename \"$key\")\"\n" +
+               "  workspacePath=\"$HELIOS_ARTIFACTS_DIR/$name\"\n" +
+               "  cachePath=\"$HELIOS_CACHE_DIR/$HELIOS_DAG_ID/$name/$fileName\"\n" +
+               "  mkdir -p \"$(dirname \"$cachePath\")\" \"$(dirname \"$workspacePath\")\"\n" +
+               "  if [ \"$HELIOS_CACHE_ENABLED\" = 'true' ] && [ -f \"$cachePath\" ]; then\n" +
+               "    echo '[HELIOS] Cache hit for ' \"$key\" ' -> ' \"$cachePath\"\n" +
+               "    cp -f \"$cachePath\" \"$workspacePath\"\n" +
+               "    continue\n" +
+               "  fi\n" +
+               "  echo '[HELIOS] Cache miss for ' \"$key\" '; downloading from MinIO...'\n" +
+               "  tmpFile=\"$cachePath.tmp\"\n" +
+               "  rm -f \"$tmpFile\"\n" +
+               "  wget --quiet --show-progress --timeout=30 --tries=3 --header=\"Host: minio\" \\\n" +
+               "    \"$HELIOS_ARTIFACTS_ENDPOINT/$HELIOS_ARTIFACTS_BUCKET/$key\" -O \"$tmpFile\" || {\n" +
+               "      echo '[HELIOS] ERROR: Download failed for ' \"$key\" ; exit 1; }\n" +
+               "  mv \"$tmpFile\" \"$cachePath\"\n" +
+               "  cp -f \"$cachePath\" \"$workspacePath\"\n" +
+               "done\n" +
+               "echo '[HELIOS] Init container completed.'";
+    }
+
     private V1Job createK8sJobDefinition(String jobName, String dagId, JsonNode taskNode,
                                          String inputArtifactsSpec,
-                                         String outputArtifactsSpec) throws IOException {
+                                         String outputArtifactsSpec,
+                                         boolean useCache) throws IOException {
         String image = taskNode.get("image").asText();
         List<String> command = objectMapper.convertValue(taskNode.get("command"), new TypeReference<List<String>>() {});
         String taskName = taskNode.get("name").asText();
@@ -682,14 +867,52 @@ public class OrchestratorService {
                 .name("artifacts-workdir")
                 .mountPath(ARTIFACTS_DIR);
 
+        // Volume for node-level cache
+        V1Volume cacheVolume = new V1Volume()
+                .name("artifact-cache")
+                .hostPath(new V1HostPathVolumeSource()
+                        .path(CACHE_HOST_PATH)
+                        .type("DirectoryOrCreate"));
+
+        V1VolumeMount cacheMount = new V1VolumeMount()
+                .name("artifact-cache")
+                .mountPath(CACHE_MOUNT_PATH);
+
+        // Smart downloader init container
+        String initContainerScript = buildInitContainerScript();
+        
+        V1Container initContainer = new V1Container()
+                .name("smart-downloader")
+                .image("alpine:3.19")
+                .command(Arrays.asList("/bin/sh", "-c", initContainerScript))
+                .addVolumeMountsItem(artifactsMount)
+                .addVolumeMountsItem(cacheMount)
+                .addEnvItem(new V1EnvVar().name("HELIOS_DAG_ID").value(dagId))
+                .addEnvItem(new V1EnvVar().name("HELIOS_TASK_NAME").value(taskName))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_DIR").value(ARTIFACTS_DIR))
+                .addEnvItem(new V1EnvVar().name("HELIOS_CACHE_DIR").value(CACHE_MOUNT_PATH))
+                .addEnvItem(new V1EnvVar().name("HELIOS_INPUT_ARTIFACTS").value(inputArtifactsSpec))
+                .addEnvItem(new V1EnvVar().name("HELIOS_OUTPUT_ARTIFACTS").value(outputArtifactsSpec))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_ENDPOINT").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_ENDPOINT", "http://minio:9000")))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_BUCKET").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_BUCKET", "helios-artifacts")))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_ACCESS_KEY").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_ACCESS_KEY", "admin")))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_SECRET_KEY").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_SECRET_KEY", "password")))
+                .addEnvItem(new V1EnvVar().name("HELIOS_CACHE_ENABLED").value(Boolean.toString(useCache)));
+
         V1Container container = new V1Container()
                 .name(cleanTaskNameK8s.substring(0, Math.min(cleanTaskNameK8s.length(), 50)) + "-cont")
                 .image(image)
                 .command(command)
                 .addVolumeMountsItem(artifactsMount)
+                .addVolumeMountsItem(cacheMount)
                 .addEnvItem(new V1EnvVar().name("HELIOS_DAG_ID").value(dagId))
                 .addEnvItem(new V1EnvVar().name("HELIOS_TASK_NAME").value(taskName))
                 .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_DIR").value(ARTIFACTS_DIR))
+                .addEnvItem(new V1EnvVar().name("HELIOS_CACHE_DIR").value(CACHE_MOUNT_PATH))
                 .addEnvItem(new V1EnvVar().name("HELIOS_INPUT_ARTIFACTS").value(inputArtifactsSpec))
                 .addEnvItem(new V1EnvVar().name("HELIOS_OUTPUT_ARTIFACTS").value(outputArtifactsSpec))
                 .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_ENDPOINT").value(
@@ -704,6 +927,8 @@ public class OrchestratorService {
         V1PodSpec podSpec = new V1PodSpec()
                 .restartPolicy("Never")
                 .addVolumesItem(artifactsVolume)
+                .addVolumesItem(cacheVolume)
+                .addInitContainersItem(initContainer)
                 .addContainersItem(container);
 
         V1PodTemplateSpec template = new V1PodTemplateSpec()
