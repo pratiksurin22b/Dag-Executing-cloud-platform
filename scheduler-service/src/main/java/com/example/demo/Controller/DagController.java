@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -66,5 +67,13 @@ public class DagController {
             );
             return ResponseEntity.internalServerError().body(response);
         }
+    }
+
+    @GetMapping("/dags/{dagName}/metrics")
+    public ResponseEntity<java.util.List<Map<String, Object>>> getDagMetrics(
+            @PathVariable String dagName,
+            @RequestParam(name = "limit", defaultValue = "20") int limit) {
+        java.util.List<Map<String, Object>> runs = orchestratorService.getDagRunMetrics(dagName, limit);
+        return ResponseEntity.ok(runs);
     }
 }

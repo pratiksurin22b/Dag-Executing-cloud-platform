@@ -1,7 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import jsyaml from 'js-yaml';
-// Import the new icon for the skipped/failed upstream status
-import { Edit3, CheckCircle, XCircle, Loader, Clock, GitBranch, AlertTriangle } from 'lucide-react';
+import { Edit3, CheckCircle, XCircle, Loader, Clock, GitBranch, AlertTriangle, Database } from 'lucide-react';
 
 const sampleYaml = `apiVersion: v1
 dagName: "guaranteed-failure-test"
@@ -63,11 +62,12 @@ const TaskItem = ({ task }) => (
 );
 
 const DagMonitor = () => {
-    // All state hooks and functions (useEffect, handleSubmit) are the same as before.
     const [yamlText, setYamlText] = useState(sampleYaml);
     const [dagState, setDagState] = useState(null);
     const [error, setError] = useState('');
     const [isSubmitting, setIsSubmitting] = useState(false);
+    const [useCache, setUseCache] = useState(true);
+    const [metrics, setMetrics] = useState([]);
     const pollingIntervalRef = useRef(null);
 
     useEffect(() => {
@@ -103,6 +103,7 @@ const DagMonitor = () => {
         setDagState(null);
         try {
             const dagObject = jsyaml.load(yamlText);
+            dagObject.useCache = useCache; // Add cache flag to payload
             const apiResponse = await fetch(apiUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -117,10 +118,24 @@ const DagMonitor = () => {
                 logs: []
             }));
             setDagState({ dagId: result.dagId, dagName: dagObject.dagName, tasks: initialTasks });
+            // Fetch metrics for this DAG name
+            fetchMetrics(dagObject.dagName);
         } catch (err) {
             setError(err.message);
         } finally {
             setIsSubmitting(false);
+        }
+    };
+
+    const fetchMetrics = async (dagName) => {
+        try {
+            const response = await fetch(`${apiUrl}/${dagName}/metrics?limit=10`);
+            if (response.ok) {
+                const data = await response.json();
+                setMetrics(data);
+            }
+        } catch (err) {
+            console.error('Failed to fetch metrics:', err);
         }
     };
 
@@ -130,6 +145,18 @@ const DagMonitor = () => {
                 <h1 style={styles.title}>DAG Orchestration Terminal</h1>
                 <div style={styles.editorContainer}>
                     <textarea style={styles.textArea} value={yamlText} onChange={(e) => setYamlText(e.target.value)} />
+                </div>
+                <div style={styles.toggleRow}>
+                    <label style={styles.toggleLabel}>
+                        <input
+                            type="checkbox"
+                            checked={useCache}
+                            onChange={e => setUseCache(e.target.checked)}
+                            style={styles.checkbox}
+                        />
+                        <Database size={18} color="#00f5ff" style={{ marginLeft: '8px', marginRight: '8px' }} />
+                        <span>Enable node-level cache for this run</span>
+                    </label>
                 </div>
                 <button style={styles.submitButton} onClick={handleSubmit} disabled={isSubmitting}>
                     {isSubmitting ? 'Submitting...' : 'Initiate Workflow'}
@@ -145,18 +172,54 @@ const DagMonitor = () => {
                      </div>
                  </div>
             )}
+            {metrics.length > 0 && (
+                <div style={{...styles.panel, marginTop: '20px'}}>
+                    <h2 style={styles.title}>Recent Runs Comparison</h2>
+                    <div style={styles.metricsTable}>
+                        <div style={styles.tableHeader}>
+                            <div style={styles.tableCell}>Run ID</div>
+                            <div style={styles.tableCell}>Status</div>
+                            <div style={styles.tableCell}>Cache</div>
+                            <div style={styles.tableCell}>Duration</div>
+                            <div style={styles.tableCell}>Started</div>
+                        </div>
+                        {metrics.map((run, idx) => (
+                            <div key={idx} style={{
+                                ...styles.tableRow,
+                                ...(run.cacheEnabled === 'true' ? styles.cacheEnabledRow : {})
+                            }}>
+                                <div style={styles.tableCell}>{run.dagId?.substring(0, 12)}...</div>
+                                <div style={styles.tableCell}>{run.status || 'RUNNING'}</div>
+                                <div style={styles.tableCell}>
+                                    {run.cacheEnabled === 'true' ? 
+                                        <span style={styles.cacheEnabledBadge}>✓ ENABLED</span> : 
+                                        <span style={styles.cacheDisabledBadge}>✗ DISABLED</span>
+                                    }
+                                </div>
+                                <div style={styles.tableCell}>
+                                    {run.duration ? `${(run.duration / 1000).toFixed(2)}s` : 'N/A'}
+                                </div>
+                                <div style={styles.tableCell}>
+                                    {run.startTime ? new Date(parseInt(run.startTime)).toLocaleTimeString() : 'N/A'}
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
         </div>
     );
 };
 
-// Updated styles to add specific colors for the status text
 const styles = {
-    // ... all other styles are the same
     container: { width: '90%', margin: '0 auto', fontFamily: 'Arial, sans-serif', padding: '20px 0' },
     panel: { width: '100%', maxWidth: '900px', backgroundColor: '#101827', border: '1px solid #00f5ff', borderRadius: '8px', padding: '30px', boxShadow: '0 0 25px rgba(0, 245, 255, 0.3)', margin: '0 auto' },
     title: { color: '#00f5ff', textAlign: 'center', margin: '0 0 20px 0' },
     editorContainer: { marginBottom: '20px' },
     textArea: { width: '100%', height: '250px', backgroundColor: '#0a0f18', border: '1px solid #334155', color: '#e0e0e0', borderRadius: '4px', padding: '15px', fontFamily: 'monospace', fontSize: '14px', boxSizing: 'border-box' },
+    toggleRow: { marginBottom: '20px', padding: '15px', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px' },
+    toggleLabel: { display: 'flex', alignItems: 'center', color: '#e0e0e0', cursor: 'pointer', fontSize: '16px' },
+    checkbox: { width: '20px', height: '20px', cursor: 'pointer', accentColor: '#00f5ff' },
     submitButton: { width: '100%', background: '#00f5ff', border: 'none', color: '#0a0f18', padding: '15px', borderRadius: '4px', fontSize: '18px', fontWeight: 'bold', cursor: 'pointer', transition: 'opacity 0.2s' },
     errorBox: { marginTop: '15px', padding: '10px', backgroundColor: '#ff4d4d20', border: '1px solid #ff4d4d', color: 'white', borderRadius: '4px', fontFamily: 'monospace' },
     dagId: { color: '#94a3b8', textAlign: 'center', marginBottom: '20px', wordBreak: 'break-all', fontSize: '14px' },
@@ -174,6 +237,13 @@ const styles = {
     },
     dependencies: { display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontSize: '12px', marginBottom: '10px', paddingLeft: '5px' },
     logs: { backgroundColor: '#0a0f18', padding: '10px', borderRadius: '4px', fontFamily: 'monospace', fontSize: '12px', color: '#e0e0e0', whiteSpace: 'pre-wrap', maxHeight: '150px', overflowY: 'auto', border: '1px solid #334155' },
+    metricsTable: { width: '100%', borderCollapse: 'collapse' },
+    tableHeader: { display: 'flex', backgroundColor: '#1e293b', padding: '12px', borderBottom: '2px solid #00f5ff', fontWeight: 'bold', color: '#00f5ff' },
+    tableRow: { display: 'flex', padding: '12px', borderBottom: '1px solid #334155', color: '#e0e0e0', transition: 'background-color 0.2s' },
+    cacheEnabledRow: { backgroundColor: '#1e293b', borderLeft: '3px solid #00ff8c' },
+    tableCell: { flex: 1, padding: '0 8px', fontSize: '14px' },
+    cacheEnabledBadge: { color: '#00ff8c', fontWeight: 'bold', fontSize: '12px' },
+    cacheDisabledBadge: { color: '#94a3b8', fontWeight: 'normal', fontSize: '12px' },
 };
 
 export default DagMonitor;
