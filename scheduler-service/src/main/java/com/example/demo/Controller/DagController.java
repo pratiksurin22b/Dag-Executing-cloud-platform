@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -65,6 +66,19 @@ public class DagController {
                     "message", "Failed to process DAG submission."
             );
             return ResponseEntity.internalServerError().body(response);
+        }
+    }
+
+    @GetMapping("/dags/{dagName}/metrics")
+    public ResponseEntity<List<Map<String, Object>>> getDagMetrics(
+            @PathVariable String dagName,
+            @RequestParam(name = "limit", defaultValue = "20") int limit) {
+        try {
+            List<Map<String, Object>> runs = orchestratorService.getDagRunMetrics(dagName, limit);
+            return ResponseEntity.ok(runs);
+        } catch (Exception e) {
+            LOGGER.error("Failed to fetch DAG run metrics for dagName={}.", dagName, e);
+            return ResponseEntity.internalServerError().build();
         }
     }
 }

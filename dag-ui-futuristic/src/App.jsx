@@ -1,164 +1,8 @@
-import React, { useState, useRef, useEffect } from 'react';
-import jsyaml from 'js-yaml';
-import { 
-    Edit3, CheckCircle, XCircle, Loader, Clock, GitBranch, AlertTriangle, 
-    Terminal, Monitor, Database, Rabbit, Box, Server, CloudOff 
+import React, { useState } from 'react';
+import {
+    Monitor, Terminal
 } from 'lucide-react';
-
-// --- Page 1: DAG Monitor (Your existing component, renamed) ---
-const DagMonitor = () => {
-    const [yamlText, setYamlText] = useState(sampleYaml);
-    const [dagState, setDagState] = useState(null);
-    const [error, setError] = useState('');
-    const [isSubmitting, setIsSubmitting] = useState(false);
-    const pollingIntervalRef = useRef(null);
-    const apiUrl = '/api/v1/dags';
-
-    useEffect(() => {
-        if (pollingIntervalRef.current) {
-            clearInterval(pollingIntervalRef.current);
-        }
-        if (dagState?.dagId) {
-            pollingIntervalRef.current = setInterval(async () => {
-                try {
-                    const response = await fetch(`${apiUrl}/${dagState.dagId}`);
-                    if (response.ok) {
-                        const data = await response.json();
-                        setDagState(data);
-                    } else {
-                        // Stop polling if DAG is not found (e.g., cleared from Redis)
-                        clearInterval(pollingIntervalRef.current);
-                    }
-                } catch (e) {
-                    console.error("Polling error:", e);
-                    clearInterval(pollingIntervalRef.current);
-                }
-            }, 2000); // Poll every 2 seconds
-        }
-        return () => {
-            if (pollingIntervalRef.current) {
-                clearInterval(pollingIntervalRef.current);
-            }
-        };
-    }, [dagState?.dagId]);
-
-    const handleSubmit = async () => {
-        setIsSubmitting(true);
-        setError('');
-        setDagState(null);
-        if (pollingIntervalRef.current) {
-            clearInterval(pollingIntervalRef.current);
-        }
-        
-        try {
-            const dagObject = jsyaml.load(yamlText);
-            const apiResponse = await fetch(apiUrl, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(dagObject),
-            });
-            if (!apiResponse.ok) throw new Error(`Server Error: ${apiResponse.status} ${apiResponse.statusText}`);
-            const result = await apiResponse.json();
-            
-            // Set initial state based on submission
-            const initialTasks = dagObject.tasks.map(t => ({
-                name: t.name,
-                status: 'PENDING',
-                dependsOn: t.depends_on || [],
-                logs: []
-            }));
-            setDagState({ dagId: result.dagId, dagName: dagObject.dagName, tasks: initialTasks });
-        } catch (err) {
-            setError(err.message || 'Failed to submit DAG. Check YAML format.');
-        } finally {
-            setIsSubmitting(false);
-        }
-    };
-
-    return (
-        <div style={styles.container}>
-            <div style={styles.panel}>
-                <h1 style={styles.title}><Terminal size={28} style={{ marginRight: '10px' }}/>DAG Orchestration Terminal</h1>
-                <div style={styles.editorContainer}>
-                    <textarea style={styles.textArea} value={yamlText} onChange={(e) => setYamlText(e.target.value)} />
-                </div>
-                <button style={styles.submitButton} onClick={handleSubmit} disabled={isSubmitting}>
-                    {isSubmitting ? <Loader className="animate-spin" /> : <Edit3 size={18} />}
-                    {isSubmitting ? 'Submitting...' : 'Initiate Workflow'}
-                </button>
-                {error && <div style={styles.errorBox}>{error}</div>}
-            </div>
-            {dagState && (
-                 <div style={{...styles.panel, marginTop: '20px'}}>
-                     <h2 style={styles.title}>Live DAG Run: {dagState.dagName}</h2>
-                     <p style={styles.dagId}>DAG Run ID: {dagState.dagId}</p>
-                     <div style={styles.taskList}>
-                         {dagState.tasks.map(task => <TaskItem key={task.name} task={task} />)}
-                     </div>
-                 </div>
-            )}
-        </div>
-    );
-};
-
-const StatusIcon = ({ status }) => {
-    switch (status) {
-        case 'SUCCEEDED': return <CheckCircle size={20} color="#00ff8c" />;
-        case 'FAILED': return <XCircle size={20} color="#ff4d4d" />;
-        case 'K8S_JOB_SUBMITTED':
-        case 'K8S_JOB_CREATING':
-        case 'QUEUED': return <Loader size={20} color="#00f5ff" className="animate-spin" />;
-        case 'PENDING': return <Clock size={20} color="#94a3b8" />;
-        case 'UPSTREAM_FAILED': 
-        case 'DISPATCH_FAILED': return <AlertTriangle size={20} color="#f59e0b" />;
-        default: return <Clock size={20} color="#94a3b8" />;
-    }
-};
-
-const TaskItem = ({ task }) => (
-    <div style={styles.taskItem}>
-        <div style={styles.taskHeader}>
-            <StatusIcon status={task.status} />
-            <span style={styles.taskName}>{task.name}</span>
-            <span style={{...styles.taskStatus, ...styles.statusColors[task.status]}}>{task.status || 'PENDING'}</span>
-        </div>
-        {task.dependsOn && task.dependsOn.length > 0 && (
-            <div style={styles.dependencies}>
-                <GitBranch size={14} color="#94a3b8" />
-                <span>Depends on: {task.dependsOn.join(', ')}</span>
-            </div>
-        )}
-        {task.logs && task.logs.length > 0 && (
-            <div style={styles.logs}>
-                {/* --- THIS IS THE FIX --- */}
-                {/* Changed `>> {log}` to `'> ' + log` to avoid JSX parsing error */}
-                {task.logs.map((log, index) => <div key={index}>{'> ' + log}</div>)}
-                {/* --- END OF FIX --- */}
-            </div>
-        )}
-    </div>
-);
-
-const sampleYaml = `apiVersion: v1
-dagName: "k8s-sequential-test"
-tasks:
-  - name: "start-job"
-    type: "command"
-    image: "ubuntu:latest"
-    command: ["/bin/bash", "-c", "echo 'K8s Task 1: Starting...' && sleep 2"]
-  - name: "process-step"
-    type: "command"
-    image: "ubuntu:latest"
-    depends_on: ["start-job"]
-    command: ["/bin/bash", "-c", "echo 'K8s Task 2: Processing...' && sleep 3"]
-  - name: "finish-job"
-    type: "command"
-    image: "ubuntu:latest"
-    depends_on: ["process-step"]
-    command: ["/bin/bash", "-c", "echo 'K8s Task 3: Job finished.'"]
-`;
-// --- End of Page 1 ---
-
+import DagMonitor from './DagSubmitter.jsx';
 
 // --- Page 2: System Health Monitor (NEW) ---
 const SystemMonitor = () => {
@@ -182,7 +26,7 @@ const SystemMonitor = () => {
         }
     };
 
-    useEffect(() => {
+    React.useEffect(() => {
         fetchStatus(); // Fetch immediately on load
         const interval = setInterval(fetchStatus, 5000); // Poll every 5 seconds
         return () => clearInterval(interval); // Cleanup on unmount
@@ -280,7 +124,7 @@ const SystemMonitor = () => {
 // --- End of Page 2 ---
 
 
-// --- Main App Component (NEW) ---
+// --- Main App Component (UPDATED) ---
 // This component wraps everything and handles navigation
 const App = () => {
     const [page, setPage] = useState('dag'); // 'dag' or 'system'
@@ -311,8 +155,8 @@ const App = () => {
         </div>
     );
 };
-// --- End of Main App ---
 
+export default App;
 
 // --- STYLES ---
 // (Combined and updated styles for all components)
@@ -437,6 +281,4 @@ const styles = {
         textOverflow: 'ellipsis'
     }
 };
-
-export default App;
 

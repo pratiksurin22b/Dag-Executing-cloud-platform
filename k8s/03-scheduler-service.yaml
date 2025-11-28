@@ -3,24 +3,24 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: scheduler-service
+  name: scheduler-service-v2
   namespace: helios
 spec:
   replicas: 1 # Start with one instance
   selector:
     matchLabels:
-      app: scheduler-service
+      app: scheduler-service-v2
   template:
     metadata:
       labels:
-        app: scheduler-service
+        app: scheduler-service-v2
     spec:
       # Associate with the Service Account that has permissions to manage Jobs
       serviceAccountName: helios-scheduler-sa
       containers:
         - name: scheduler-service
           # Updated to match the latest pushed image tag
-          image: pratik9634/scheduler-service:healthfix
+          image: pratik9634/scheduler-service:auth-fix-v1
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -28,6 +28,16 @@ spec:
             # Use Kubernetes internal DNS names to find other services
             - name: SPRING_RABBITMQ_HOST
               value: "rabbitmq.helios.svc.cluster.local" # service-name.namespace.svc.cluster.local
+            - name: SPRING_RABBITMQ_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secret
+                  key: username
+            - name: SPRING_RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rabbitmq-secret
+                  key: password
             - name: SPRING_DATA_REDIS_HOST
               value: "redis.helios.svc.cluster.local"
             - name: HELIOS_ARTIFACTS_ENDPOINT
@@ -78,6 +88,6 @@ spec:
     - port: 8080 # Port the service listens on internally
       targetPort: 8080 # Port the container exposes
   selector:
-    app: scheduler-service
+    app: scheduler-service-v2
   # ClusterIP makes it reachable only within the Kubernetes cluster (e.g., by the frontend proxy)
   type: ClusterIP

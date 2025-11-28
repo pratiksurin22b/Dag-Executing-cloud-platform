@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map; // NEW Import
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors; // NEW Import
 import java.util.stream.StreamSupport;
 
@@ -72,6 +73,9 @@ public class OrchestratorService {
 
     // Base directory inside task containers for artifact files
     private static final String ARTIFACTS_DIR = "/artifacts";
+    // Node-local cache configuration (hostPath mounted into pods)
+    private static final String CACHE_HOST_PATH = "/var/helios/cache";
+    private static final String CACHE_MOUNT_PATH = "/cache";
 
 
     @Autowired
@@ -351,7 +355,28 @@ public class OrchestratorService {
     public String processNewDagSubmission(JsonNode dagPayload) {
         String dagId = "dag-" + UUID.randomUUID();
         try {
+            // Persist raw DAG definition
             redisTemplate.opsForValue().set("dag:" + dagId + ":definition", dagPayload.toString());
+
+            // NEW: Extract caching flag from payload (default false)
+            boolean useCache = dagPayload.has("useCache") && dagPayload.get("useCache").asBoolean(false);
+            redisTemplate.opsForValue().set("dag:" + dagId + ":useCache", Boolean.toString(useCache));
+
+            // NEW: Initialize basic DAG-run metrics
+            long startMillis = System.currentTimeMillis();
+            String dagName = dagPayload.has("dagName") ? dagPayload.get("dagName").asText() : dagId;
+            String metricsKey = "dag:" + dagId + ":metrics";
+            redisTemplate.opsForHash().put(metricsKey, "dagId", dagId);
+            redisTemplate.opsForHash().put(metricsKey, "dagName", dagName);
+            redisTemplate.opsForHash().put(metricsKey, "startTime", Long.toString(startMillis));
+            redisTemplate.opsForHash().put(metricsKey, "status", "RUNNING");
+            redisTemplate.opsForHash().put(metricsKey, "cacheEnabled", Boolean.toString(useCache));
+
+            // Maintain per-dagName list of recent runs (for UI metrics view)
+            String runsListKey = "dagRuns:" + dagName;
+            redisTemplate.opsForList().leftPush(runsListKey, dagId);
+            redisTemplate.opsForList().trim(runsListKey, 0, 49); // keep last 50 runs
+
             dagPayload.get("tasks").forEach(taskNode -> {
                 String taskName = taskNode.get("name").asText();
                 redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "PENDING");
@@ -405,13 +430,18 @@ public class OrchestratorService {
             long nextAttempt = (currentAttemptStr == null) ? 1 : (Long.parseLong(currentAttemptStr) + 1);
             redisTemplate.opsForValue().set(attemptKey, String.valueOf(nextAttempt));
 
-            // Build artifact mappings (simple convention: outputs are written under /artifacts/<name>,
-            // and inputs with explicit fromTask/name mapping are downloaded to the same path)
             String inputArtifactsSpec = buildInputArtifactsSpec(dagId, taskNode);
             String outputArtifactsSpec = buildOutputArtifactsSpec(dagId, taskNode);
 
-            V1Job job = createK8sJobDefinition(jobName, dagId, taskNode, inputArtifactsSpec, outputArtifactsSpec);
-            LOGGER.info("Submitting Kubernetes Job '{}' for task '{}' (Attempt {})...", jobName, taskName, nextAttempt);
+            // Read caching flag from Redis and pass to job definition
+            boolean useCache = Boolean.parseBoolean(
+                    redisTemplate.opsForValue().get("dag:" + dagId + ":useCache")
+            );
+
+            V1Job job = createK8sJobDefinition(jobName, dagId, taskNode,
+                    inputArtifactsSpec, outputArtifactsSpec, useCache);
+            LOGGER.info("Submitting Kubernetes Job '{}' for task '{}' (Attempt {}, useCache={})...",
+                    jobName, taskName, nextAttempt, useCache);
             V1Job createdJob = batchV1Api.createNamespacedJob(
                     "helios", job, null, null, null, null
             );
@@ -421,11 +451,12 @@ public class OrchestratorService {
         } catch (ApiException e) {
             LOGGER.error("Kubernetes API Error dispatching task '{}': {}", taskName, e.getResponseBody(), e);
             redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "DISPATCH_FAILED");
-            handleTaskFailure(dagId, taskName);
+            // If Job creation fails immediately, treat as a task failure to trigger propagation
+            handleTaskFailureInternal(dagId, taskName);
         } catch (Exception e) {
             LOGGER.error("Failed to create/dispatch K8s Job for task '{}'", taskName, e);
             redisTemplate.opsForValue().set("dag:" + dagId + ":task:" + taskName + ":status", "DISPATCH_FAILED");
-            handleTaskFailure(dagId, taskName);
+            handleTaskFailureInternal(dagId, taskName);
         }
     }
 
@@ -478,53 +509,160 @@ public class OrchestratorService {
         processJobResult(dagId, taskName, succeeded, logs);
     }
 
-    // --- fetchPodLogsForJob (v18 pattern - Unchanged) ---
+    // --- fetchPodLogsForJob (v18 pattern) ---
     private String fetchPodLogsForJob(String jobName, String namespace) {
-        try {
-            String labelSelector = "job-name=" + jobName;
-            V1PodList podList = coreV1Api.listNamespacedPod(
-                    namespace, null, null, null, null, labelSelector, null, null, null, null, null
-            );
+        // Keep the public signature simple and delegate to a retrying helper
+        int maxAttempts = 10;
+        long initialBackoffMs = 500L;
+        long maxBackoffMs = 3000L;
+        long maxTotalWaitMs = 30000L;
+        return fetchPodLogsWithRetry(jobName, namespace, maxAttempts, initialBackoffMs, maxBackoffMs, maxTotalWaitMs);
+    }
 
-            if (podList != null && !podList.getItems().isEmpty()) {
-                V1Pod pod = podList.getItems().get(0);
-                String podName = pod.getMetadata().getName();
-                String containerName = (pod.getSpec() != null && !pod.getSpec().getContainers().isEmpty())
-                        ? pod.getSpec().getContainers().get(0).getName() : null;
-                if (containerName == null) {
-                    return "Error: Container name not found.";
-                }
-                String podPhase = pod.getStatus() != null ? pod.getStatus().getPhase() : "Unknown";
+    /**
+     * More robust log fetching that tolerates races where the Job is marked complete
+     * but the Pod/container is still in PodInitializing or not yet ready for logs.
+     * Always returns a non-null String (may be an explanatory error message).
+     */
+    private String fetchPodLogsWithRetry(String jobName,
+                                         String namespace,
+                                         int maxAttempts,
+                                         long initialBackoffMs,
+                                         long maxBackoffMs,
+                                         long maxTotalWaitMs) {
+        long startTime = System.currentTimeMillis();
+        long backoff = initialBackoffMs;
+        ApiException lastApiException = null;
+        Exception lastGenericException = null;
 
-                if ("Succeeded".equals(podPhase) || "Failed".equals(podPhase)) {
-                    String logContent = coreV1Api.readNamespacedPodLog(
-                            podName,                          // name
-                            namespace,                        // namespace
-                            containerName,                    // container
-                            Boolean.FALSE,                    // follow
-                            Boolean.FALSE,                    // insecureSkipTLSVerifyBackend or pretty (per v18)
-                            (Integer) null,                   // limitBytes
-                            (String) null,                    // sinceTime
-                            Boolean.FALSE,                    // timestamps
-                            (Integer) null,                   // sinceSeconds
-                            (Integer) null,                   // tailLines
-                            Boolean.FALSE                     // limitBytes? or some boolean flag (per v18)
-                    );
-                    return logContent != null ? logContent : "";
-                } else {
-                    return "Pod logs not ready (Phase: " + podPhase + ")";
-                }
-            } else {
-                return "Error: Pod not found.";
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            long elapsed = System.currentTimeMillis() - startTime;
+            if (elapsed > maxTotalWaitMs) {
+                break;
             }
-        } catch (ApiException e) {
-            if (e.getCode() == 404) { return "Error: Pod/Job not found."; }
-            LOGGER.error("K8s API Error fetching logs for Job '{}': {}", jobName, e.getResponseBody(), e);
-            return "Error fetching logs: API Error " + e.getCode();
-        } catch (Exception e) {
-            LOGGER.error("Unexpected error fetching logs for Job '{}'", jobName, e);
-            return "Error fetching logs: " + e.getMessage();
+
+            try {
+                String labelSelector = "job-name=" + jobName;
+                V1PodList podList = coreV1Api.listNamespacedPod(
+                        namespace, null, null, null, null, labelSelector,
+                        null, null, null, null, null
+                );
+
+                if (podList == null || podList.getItems() == null || podList.getItems().isEmpty()) {
+                    // No pod yet for this job, backoff and retry
+                    LOGGER.debug("Log fetch attempt {} for job '{}' - no pods found yet.", attempt, jobName);
+                } else {
+                    V1Pod pod = podList.getItems().get(0);
+                    String podName = pod.getMetadata() != null ? pod.getMetadata().getName() : null;
+                    String podPhase = pod.getStatus() != null ? pod.getStatus().getPhase() : "Unknown";
+
+                    if (podName == null) {
+                        LOGGER.warn("Log fetch attempt {} for job '{}' - pod without name.", attempt, jobName);
+                    } else {
+                        String containerName = null;
+                        if (pod.getSpec() != null && pod.getSpec().getContainers() != null && !pod.getSpec().getContainers().isEmpty()) {
+                            // Prefer the main task container if named, otherwise first container
+                            containerName = pod.getSpec().getContainers().get(0).getName();
+                        }
+                        if (containerName == null) {
+                            return "Error: Container name not found for pod '" + podName + "'.";
+                        }
+
+                        boolean terminalPhase = "Succeeded".equals(podPhase) || "Failed".equals(podPhase);
+                        boolean initializing = false;
+                        if (pod.getStatus() != null && pod.getStatus().getContainerStatuses() != null) {
+                            for (V1ContainerStatus cStatus : pod.getStatus().getContainerStatuses()) {
+                                if (cStatus.getState() != null && cStatus.getState().getWaiting() != null) {
+                                    String reason = cStatus.getState().getWaiting().getReason();
+                                    if (reason != null && reason.contains("PodInitializing")) {
+                                        initializing = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!terminalPhase || initializing) {
+                            // Pod still starting or running; logs may not yet be readable. Retry.
+                            LOGGER.debug(
+                                    "Log fetch attempt {} for job '{}' - pod '{}' phase='{}', initializing={}. Retrying...",
+                                    attempt, jobName, podName, podPhase, initializing
+                            );
+                        } else {
+                            // Pod is in a terminal phase; try to read logs.
+                            try {
+                                String logContent = coreV1Api.readNamespacedPodLog(
+                                        podName,
+                                        namespace,
+                                        containerName,
+                                        Boolean.FALSE,
+                                        Boolean.FALSE,
+                                        (Integer) null,
+                                        (String) null,
+                                        Boolean.FALSE,
+                                        (Integer) null,
+                                        (Integer) null,
+                                        Boolean.FALSE
+                                );
+                                return logContent != null ? logContent : "";
+                            } catch (ApiException e) {
+                                lastApiException = e;
+                                // 400 BadRequest often means the container is not ready yet; retry those.
+                                if (e.getCode() == 400 || e.getCode() == 404 || e.getCode() == 409 || e.getCode() >= 500) {
+                                    LOGGER.warn("K8s API error fetching logs for job '{}' pod '{}': {} (code {}). Will retry if attempts remain.",
+                                            jobName, podName, e.getResponseBody(), e.getCode());
+                                } else {
+                                    LOGGER.error("Non-retryable K8s API error fetching logs for job '{}' pod '{}': {} (code {}).",
+                                            jobName, podName, e.getResponseBody(), e.getCode());
+                                    return "Error fetching logs: API Error " + e.getCode();
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (ApiException e) {
+                lastApiException = e;
+                // For list pods failure, some codes may be transient.
+                LOGGER.warn("K8s API error listing pods for job '{}': {} (code {}). Attempt {} of {}.",
+                        jobName, e.getResponseBody(), e.getCode(), attempt, maxAttempts);
+            } catch (Exception e) {
+                lastGenericException = e;
+                LOGGER.warn("Unexpected error during log fetch attempt {} for job '{}': {}", attempt, jobName, e.getMessage());
+            }
+
+            // Sleep before next attempt if there are attempts left
+            if (attempt < maxAttempts) {
+                try {
+                    long sleepMs = Math.min(backoff, maxBackoffMs);
+                    long remaining = maxTotalWaitMs - (System.currentTimeMillis() - startTime);
+                    if (remaining <= 0) {
+                        break;
+                    }
+                    sleepMs = Math.min(sleepMs, remaining);
+                    Thread.sleep(sleepMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                backoff = Math.min(backoff * 2, maxBackoffMs);
+            }
         }
+
+        // If we reach here, all retries are exhausted or total wait exceeded.
+        if (lastApiException != null) {
+            LOGGER.error("Exhausted log fetch retries for job '{}'. Last K8s API error: {} (code {}).",
+                    jobName, lastApiException.getResponseBody(), lastApiException.getCode());
+            return "Error fetching logs after retries: API Error " + lastApiException.getCode();
+        }
+        if (lastGenericException != null) {
+            LOGGER.error("Exhausted log fetch retries for job '{}'. Last error: {}",
+                    jobName, lastGenericException.getMessage(), lastGenericException);
+            return "Error fetching logs after retries: " + lastGenericException.getMessage();
+        }
+
+        long totalElapsed = System.currentTimeMillis() - startTime;
+        LOGGER.warn("Exhausted log fetch retries for job '{}' after {} ms without obtaining logs.", jobName, totalElapsed);
+        return "Pod logs not available after waiting " + totalElapsed + " ms";
     }
 
 
@@ -547,64 +685,50 @@ public class OrchestratorService {
             } else {
                 handleTaskFailure(dagId, taskName);
             }
+
+            // NEW: when all tasks have terminal status, finalize DAG metrics
+            finalizeDagMetricsIfComplete(dagId);
         } catch (Exception e) {
             LOGGER.error("CRITICAL: Failed to process final job result for task '{}', DAG '{}'.", taskName, dagId, e);
         }
     }
 
-
-    // --- handleTaskFailure (Refined logic - Unchanged) ---
-    private void handleTaskFailure(String dagId, String taskName) {
+    private void finalizeDagMetricsIfComplete(String dagId) {
         try {
             String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
             if (dagJson == null) { return; }
             JsonNode dagPayload = objectMapper.readTree(dagJson);
-            JsonNode taskNode = findTaskNode(dagPayload, taskName);
-            if (taskNode == null) { return; }
 
-            int maxRetries = taskNode.path("retries").path("count").asInt(0);
-            String attemptKey = String.format("dag:%s:task:%s:attempts", dagId, taskName);
-            long attemptsMade = redisTemplate.opsForValue().increment(attemptKey); // Increments and returns the new value
-
-            if (attemptsMade <= maxRetries + 1) { // We check <= maxRetries + 1 because the first attempt is 1
-                if(attemptsMade <= maxRetries) { // This means we have retries left
-                    LOGGER.warn("Task '{}' FAILED on attempt {}. Re-dispatching for retry... (Max retries: {})", taskName, attemptsMade, maxRetries);
-                    dispatchTask(dagId, taskNode);
-                } else { // This means attemptsMade == maxRetries + 1, which was the final attempt
-                    LOGGER.error("Task '{}' FAILED on final attempt {}. Initiating failure propagation.", taskName, attemptsMade -1); // Log the attempt number that failed
-                    redisTemplate.opsForValue().set(String.format("dag:%s:task:%s:status", dagId, taskName), "FAILED");
-                    propagateFailure(dagId, taskName);
+            boolean allTerminal = true;
+            boolean anyFailed = false;
+            for (JsonNode taskNode : dagPayload.get("tasks")) {
+                String taskName = taskNode.get("name").asText();
+                String status = redisTemplate.opsForValue().get(
+                        String.format("dag:%s:task:%s:status", dagId, taskName));
+                if (status == null || (!"SUCCEEDED".equals(status) && !"FAILED".equals(status) && !"UPSTREAM_FAILED".equals(status))) {
+                    allTerminal = false;
+                    break;
+                }
+                if ("FAILED".equals(status) || "UPSTREAM_FAILED".equals(status)) {
+                    anyFailed = true;
                 }
             }
-        } catch (Exception e) {
-            LOGGER.error("Unexpected error during failure handling for task '{}', DAG '{}'", taskName, dagId, e);
-        }
-    }
 
-    // --- propagateFailure (Refined logic - Unchanged) ---
-    public void propagateFailure(String dagId, String failedTaskName) {
-        try {
-            String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
-            if (dagJson == null) { return; }
-            JsonNode dagPayload = objectMapper.readTree(dagJson);
-            dagPayload.get("tasks").forEach(taskNode -> {
-                if (taskNode.has("depends_on")) {
-                    taskNode.get("depends_on").forEach(depNode -> {
-                        if (depNode.asText().equals(failedTaskName)) {
-                            String childTaskName = taskNode.get("name").asText();
-                            String childStatusKey = String.format("dag:%s:task:%s:status", dagId, childTaskName);
-                            String currentChildStatus = redisTemplate.opsForValue().get(childStatusKey);
-                            if ("PENDING".equals(currentChildStatus)) {
-                                redisTemplate.opsForValue().set(childStatusKey, "UPSTREAM_FAILED");
-                                LOGGER.warn("Propagating failure: Task '{}' marked as UPSTREAM_FAILED.", childTaskName);
-                                propagateFailure(dagId, childTaskName);
-                            }
-                        }
-                    });
-                }
-            });
-        } catch (IOException e) {
-            LOGGER.error("Failed to read DAG definition during failure propagation for DAG ID: {}", dagId, e);
+            if (!allTerminal) {
+                return; // still running
+            }
+
+            long endMillis = System.currentTimeMillis();
+            String metricsKey = "dag:" + dagId + ":metrics";
+            Object startTimeRaw = redisTemplate.opsForHash().get(metricsKey, "startTime");
+            long startMillis = (startTimeRaw != null) ? Long.parseLong(startTimeRaw.toString()) : endMillis;
+            long durationMs = Math.max(0, endMillis - startMillis);
+
+            redisTemplate.opsForHash().put(metricsKey, "endTime", Long.toString(endMillis));
+            redisTemplate.opsForHash().put(metricsKey, "durationMs", Long.toString(durationMs));
+            redisTemplate.opsForHash().put(metricsKey, "status", anyFailed ? "FAILED" : "SUCCEEDED");
+        } catch (Exception e) {
+            LOGGER.error("Failed to finalize DAG metrics for DAG ID: {}", dagId, e);
         }
     }
 
@@ -657,7 +781,8 @@ public class OrchestratorService {
 
     private V1Job createK8sJobDefinition(String jobName, String dagId, JsonNode taskNode,
                                          String inputArtifactsSpec,
-                                         String outputArtifactsSpec) throws IOException {
+                                         String outputArtifactsSpec,
+                                         boolean useCache) throws IOException {
         String image = taskNode.get("image").asText();
         List<String> command = objectMapper.convertValue(taskNode.get("command"), new TypeReference<List<String>>() {});
         String taskName = taskNode.get("name").asText();
@@ -671,9 +796,9 @@ public class OrchestratorService {
                 .namespace("helios")
                 .putLabelsItem("app", "helios-task")
                 .putLabelsItem("helios-dag-id", cleanDagIdK8s)
-                .putLabelsItem("helios-task-name", cleanTaskNameK8s);
+                .putLabelsItem("helios-task-name", cleanTaskNameK8s)
+                .putAnnotationsItem("helios/cache-enabled", Boolean.toString(useCache));
 
-        // Volume for artifact workspace
         V1Volume artifactsVolume = new V1Volume()
                 .name("artifacts-workdir")
                 .emptyDir(new V1EmptyDirVolumeSource());
@@ -682,29 +807,95 @@ public class OrchestratorService {
                 .name("artifacts-workdir")
                 .mountPath(ARTIFACTS_DIR);
 
-        V1Container container = new V1Container()
+        // Node-local cache volume (hostPath)
+        V1Volume cacheVolume = new V1Volume()
+                .name("artifact-cache")
+                .hostPath(new V1HostPathVolumeSource()
+                        .path(CACHE_HOST_PATH)
+                        .type("DirectoryOrCreate"));
+
+        V1VolumeMount cacheMount = new V1VolumeMount()
+                .name("artifact-cache")
+                .mountPath(CACHE_MOUNT_PATH);
+
+        // Shared env across containers
+        List<V1EnvVar> commonEnv = Arrays.asList(
+                new V1EnvVar().name("HELIOS_DAG_ID").value(dagId),
+                new V1EnvVar().name("HELIOS_TASK_NAME").value(taskName),
+                new V1EnvVar().name("HELIOS_ARTIFACTS_DIR").value(ARTIFACTS_DIR),
+                new V1EnvVar().name("HELIOS_CACHE_DIR").value(CACHE_MOUNT_PATH),
+                new V1EnvVar().name("HELIOS_INPUT_ARTIFACTS").value(inputArtifactsSpec),
+                new V1EnvVar().name("HELIOS_OUTPUT_ARTIFACTS").value(outputArtifactsSpec),
+                new V1EnvVar().name("HELIOS_ARTIFACTS_ENDPOINT").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_ENDPOINT", "http://minio:9000")),
+                new V1EnvVar().name("HELIOS_ARTIFACTS_BUCKET").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_BUCKET", "helios-artifacts")),
+                new V1EnvVar().name("HELIOS_ARTIFACTS_ACCESS_KEY").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_ACCESS_KEY", "admin")),
+                new V1EnvVar().name("HELIOS_ARTIFACTS_SECRET_KEY").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_SECRET_KEY", "password")),
+                new V1EnvVar().name("HELIOS_CACHE_ENABLED").value(Boolean.toString(useCache))
+        );
+
+        // Init container: smart downloader with cache
+        String initScript = String.join("\n",
+                "set -e",
+                "echo '[HELIOS] Running init script version 3.0 (POSIX compliant).'",
+                "echo '[HELIOS] Init container starting for task ' \"$HELIOS_TASK_NAME\"",
+                "if [ -n \"$HELIOS_INPUT_ARTIFACTS\" ]; then",
+                "  echo \"$HELIOS_INPUT_ARTIFACTS\" | while IFS=';' read -r ARTIFACT_PAIRS; do",
+                "    for pair in $ARTIFACT_PAIRS; do",
+                "      [ -z \"$pair\" ] && continue",
+                "      name=\"${pair%%=*}\"",
+                "      key=\"${pair#*=}\"",
+                "      fileName=\"$(basename \"$key\")\"",
+                "      workspacePath=\"$HELIOS_ARTIFACTS_DIR/$name\"",
+                "      cachePath=\"$HELIOS_CACHE_DIR/$HELIOS_DAG_ID/$name/$fileName\"",
+                "      mkdir -p \"$(dirname \"$cachePath\")\" \"$(dirname \"$workspacePath\")\"",
+                "      if [ \"$HELIOS_CACHE_ENABLED\" = 'true' ] && [ -f \"$cachePath\" ]; then",
+                "        echo '[HELIOS] Cache hit for ' \"$key\" ' -> ' \"$cachePath\"",
+                "        cp -f \"$cachePath\" \"$workspacePath\"",
+                "        continue",
+                "      fi",
+                "      echo '[HELIOS] Cache miss for ' \"$key\" '; downloading from MinIO...'",
+                "      tmpFile=\"$cachePath.tmp\"",
+                "      rm -f \"$tmpFile\"",
+                "      curl -sS --fail --retry 3 --connect-timeout 30 \\",
+                "        \"$HELIOS_ARTIFACTS_ENDPOINT/$HELIOS_ARTIFACTS_BUCKET/$key\" -o \"$tmpFile\" || {",
+                "          echo '[HELIOS] ERROR: Download failed for ' \"$key\" ; exit 1; }",
+                "      mv \"$tmpFile\" \"$cachePath\"",
+                "      cp -f \"$cachePath\" \"$workspacePath\"",
+                "    done",
+                "  done",
+                "fi",
+                "echo '[HELIOS] Init container completed.'"
+        );
+
+        V1Container initContainer = new V1Container()
+                .name(cleanTaskNameK8s.substring(0, Math.min(cleanTaskNameK8s.length(), 40)) + "-init")
+                .image("curlimages/curl:8.10.1")
+                .addCommandItem("/bin/sh")
+                .addArgsItem("-c")
+                .addArgsItem(initScript)
+                .addVolumeMountsItem(artifactsMount)
+                .addVolumeMountsItem(cacheMount)
+                .env(commonEnv);
+
+
+        V1Container mainContainer = new V1Container()
                 .name(cleanTaskNameK8s.substring(0, Math.min(cleanTaskNameK8s.length(), 50)) + "-cont")
                 .image(image)
                 .command(command)
                 .addVolumeMountsItem(artifactsMount)
-                .addEnvItem(new V1EnvVar().name("HELIOS_DAG_ID").value(dagId))
-                .addEnvItem(new V1EnvVar().name("HELIOS_TASK_NAME").value(taskName))
-                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_DIR").value(ARTIFACTS_DIR))
-                .addEnvItem(new V1EnvVar().name("HELIOS_INPUT_ARTIFACTS").value(inputArtifactsSpec))
-                .addEnvItem(new V1EnvVar().name("HELIOS_OUTPUT_ARTIFACTS").value(outputArtifactsSpec))
-                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_ENDPOINT").value(
-                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_ENDPOINT", "http://minio:9000")))
-                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_BUCKET").value(
-                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_BUCKET", "helios-artifacts")))
-                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_ACCESS_KEY").value(
-                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_ACCESS_KEY", "admin")))
-                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_SECRET_KEY").value(
-                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_SECRET_KEY", "password")));
+                .addVolumeMountsItem(cacheMount)
+                .env(commonEnv);
 
         V1PodSpec podSpec = new V1PodSpec()
                 .restartPolicy("Never")
                 .addVolumesItem(artifactsVolume)
-                .addContainersItem(container);
+                .addVolumesItem(cacheVolume)
+                .addInitContainersItem(initContainer)
+                .addContainersItem(mainContainer);
 
         V1PodTemplateSpec template = new V1PodTemplateSpec()
                 .metadata(new V1ObjectMeta()
@@ -725,5 +916,69 @@ public class OrchestratorService {
                 .metadata(jobMeta)
                 .spec(jobSpec);
     }
-}
 
+    // Internal helper that encapsulates retry & failure propagation
+    private void handleTaskFailureInternal(String dagId, String taskName) {
+        try {
+            String dagJson = redisTemplate.opsForValue().get("dag:" + dagId + ":definition");
+            if (dagJson == null) { return; }
+            JsonNode dagPayload = objectMapper.readTree(dagJson);
+            JsonNode taskNode = findTaskNode(dagPayload, taskName);
+            if (taskNode == null) { return; }
+
+            int maxRetries = taskNode.path("retries").path("count").asInt(0);
+            String attemptKey = String.format("dag:%s:task:%s:attempts", dagId, taskName);
+            long attemptsMade = redisTemplate.opsForValue().increment(attemptKey);
+
+            if (attemptsMade <= maxRetries + 1) {
+                if (attemptsMade <= maxRetries) {
+                    LOGGER.warn("Task '{}' FAILED on attempt {}. Re-dispatching for retry... (Max retries: {})", taskName, attemptsMade, maxRetries);
+                    dispatchTask(dagId, taskNode);
+                } else {
+                    LOGGER.error("Task '{}' FAILED on final attempt {}. Initiating failure propagation.", taskName, attemptsMade - 1);
+                    redisTemplate.opsForValue().set(String.format("dag:%s:task:%s:status", dagId, taskName), "FAILED");
+                    propagateFailure(dagId, taskName);
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.error("Unexpected error during failure handling for task '{}', DAG '{}'", taskName, dagId, e);
+        }
+    }
+
+    // Public API used by other components like ResultListener
+    public void handleTaskFailure(String dagId, String taskName) {
+        handleTaskFailureInternal(dagId, taskName);
+    }
+
+    // Existing propagateFailure method should remain public
+    public void propagateFailure(String dagId, String failedTaskName) {
+        // ...existing propagateFailure implementation...
+    }
+
+    // Expose run-metrics retrieval for controller
+    public List<Map<String, Object>> getDagRunMetrics(String dagName, int limit) {
+        String runsListKey = "dagRuns:" + dagName;
+        List<String> dagIds = redisTemplate.opsForList().range(runsListKey, 0, limit - 1);
+        if (dagIds == null || dagIds.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<Map<String, Object>> runs = new ArrayList<>();
+        for (String dagId : dagIds) {
+            String metricsKey = "dag:" + dagId + ":metrics";
+            Map<Object, Object> raw = redisTemplate.opsForHash().entries(metricsKey);
+            if (raw == null || raw.isEmpty()) {
+                continue;
+            }
+            Map<String, Object> run = raw.entrySet().stream()
+                    .collect(Collectors.toMap(e -> e.getKey().toString(), Map.Entry::getValue));
+            run.put("dagId", dagId);
+            runs.add(run);
+        }
+        runs.sort((a, b) -> {
+            long sa = Long.parseLong(String.valueOf(a.getOrDefault("startTime", "0")));
+            long sb = Long.parseLong(String.valueOf(b.getOrDefault("startTime", "0")));
+            return Long.compare(sb, sa);
+        });
+        return runs;
+    }
+}

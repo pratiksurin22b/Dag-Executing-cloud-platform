@@ -20,7 +20,7 @@ spec:
       containers:
         - name: frontend
           # Updated to new tag including health endpoint changes
-          image: pratik9634/frontend:healthfix
+          image: pratik9634/frontend:minio-cache-ui
           imagePullPolicy: Always
           ports:
             - containerPort: 80

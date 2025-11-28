@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: helios-cache-prep
+  namespace: helios
+  labels:
+    app: helios-cache-prep
+spec:
+  selector:
+    matchLabels:
+      app: helios-cache-prep
+  template:
+    metadata:
+      labels:
+        app: helios-cache-prep
+    spec:
+      # This pod prepares /var/helios/cache on every node for hostPath caching
+      tolerations:
+        - operator: "Exists"  # allow running on tainted nodes (masters etc.)
+      containers:
+        - name: cache-prep
+          image: alpine:3.19
+          securityContext:
+            privileged: true
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "[HELIOS] Preparing /var/helios/cache on host..."
+              mkdir -p /host/var/helios/cache
+              # Default to permissive; can be tightened later if you run non-root with matching UID/GID
+              chmod 777 /host/var/helios/cache
+              echo "[HELIOS] /var/helios/cache prepared on host $(hostname)."
+              # Keep the pod running so DaemonSet stays healthy
+              tail -f /dev/null
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+
