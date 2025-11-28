@@ -879,11 +879,45 @@ public class OrchestratorService {
                 .addVolumeMountsItem(cacheMount)
                 .env(commonEnv);
 
+        // --- NEW: Wrapper Script to Run Command & Upload Artifacts ---
+        StringBuilder wrapperScript = new StringBuilder();
+        wrapperScript.append("set -e\n"); // Fail fast if command fails
 
+        // 1. Run the User's Command
+        if (command != null && !command.isEmpty()) {
+            // Join the command list into a string
+            wrapperScript.append(String.join(" ", command)).append("\n");
+        }
+
+        // 2. Upload Logic (Runs only if command succeeds)
+        wrapperScript.append("echo '[HELIOS] Task finished. Starting artifact upload...'\n");
+        wrapperScript.append("if [ -n \"$HELIOS_OUTPUT_ARTIFACTS\" ]; then\n");
+        wrapperScript.append("  echo \"$HELIOS_OUTPUT_ARTIFACTS\" | while IFS=';' read -r ARTIFACT_PAIRS; do\n");
+        wrapperScript.append("    for pair in $ARTIFACT_PAIRS; do\n");
+        wrapperScript.append("      [ -z \"$pair\" ] && continue\n");
+        wrapperScript.append("      name=\"${pair%%=*}\"\n");
+        wrapperScript.append("      key=\"${pair#*=}\"\n");
+        wrapperScript.append("      localPath=\"$HELIOS_ARTIFACTS_DIR/$name\"\n");
+
+        wrapperScript.append("      if [ -f \"$localPath\" ]; then\n");
+        wrapperScript.append("        echo \"[HELIOS] Uploading '$name'...\"\n");
+        // Upload using curl. Requires curl in the image.
+        wrapperScript.append("        curl -sS --fail --retry 3 --connect-timeout 30 -T \"$localPath\" \\\n");
+        wrapperScript.append("          \"$HELIOS_ARTIFACTS_ENDPOINT/$HELIOS_ARTIFACTS_BUCKET/$key\" || exit 1\n");
+        wrapperScript.append("      else\n");
+        wrapperScript.append("        echo \"[HELIOS] WARNING: Expected output '$name' not found at '$localPath'. Skipping.\"\n");
+        wrapperScript.append("      fi\n");
+        wrapperScript.append("    done\n");
+        wrapperScript.append("  done\n");
+        wrapperScript.append("fi\n");
+        wrapperScript.append("echo '[HELIOS] Artifact upload completed.'\n");
+
+        // 3. Create the Main Container with the Wrapper
         V1Container mainContainer = new V1Container()
                 .name(cleanTaskNameK8s.substring(0, Math.min(cleanTaskNameK8s.length(), 50)) + "-cont")
                 .image(image)
-                .command(command)
+                // OVERRIDE the command to run our shell wrapper instead
+                .command(List.of("/bin/sh", "-c", wrapperScript.toString()))
                 .addVolumeMountsItem(artifactsMount)
                 .addVolumeMountsItem(cacheMount)
                 .env(commonEnv);
