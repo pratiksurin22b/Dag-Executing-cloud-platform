@@ -100,4 +100,4 @@ if [ -n "$HELIOS_INPUT_ARTIFACTS" ]; then
 fi
 ```
 
-This prevents the shell syntax error: `unexpected redirection` that occurred when the `echo ... | while ...` command was executed with an empty input.
+This prevents the shell syntax error: `unexpected redirection` that occurred when `HELIOS_INPUT_ARTIFACTS` was empty, causing the `echo` command to pipe empty content to the `while` loop.
