@@ -20,8 +20,6 @@ public class ArtifactStorageConfig {
     @Bean
     public MinioClient minioClient() {
         return MinioClient.builder()
-                .endpoint(endpoint)
-                .credentials(accessKey, secretKey)
-                .build();
+                .endpoint(endpoint).build();
     }
 }

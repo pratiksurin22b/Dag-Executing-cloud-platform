@@ -1,0 +1,98 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-minio-user-job
+  namespace: helios
+spec:
+  template:
+    spec:
+      serviceAccountName: helios-scheduler-sa
+      restartPolicy: Never
+      containers:
+        - name: mc-job
+          image: minio/mc
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              echo "Waiting for MinIO to be ready..."
+              mc alias set helios http://minio.helios.svc.cluster.local:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD
+              
+              echo "Writing readwrite policy JSON to /tmp/policy.json..."
+              cat > /tmp/policy.json << 'EOF'
+              {
+                "Version": "2012-10-17",
+                "Statement": [
+                  {
+                    "Effect": "Allow",
+                    "Action": [
+                      "s3:*"
+                    ],
+                    "Resource": [
+                      "arn:aws:s3:::helios-artifacts",
+                      "arn:aws:s3:::helios-artifacts/*"
+                    ]
+                  }
+                ]
+              }
+              EOF
+              
+              echo "Creating readwrite policy..."
+              mc admin policy create helios readwrite /tmp/policy.json || echo "Policy already exists."
+              
+              echo "Creating MinIO user 'dag-runner'..."
+              mc admin user add helios dag-runner dag-runner-password || echo "User 'dag-runner' already exists."
+              
+              echo "Attaching 'readwrite' policy to user 'dag-runner'..."
+              mc admin policy attach helios readwrite --user dag-runner || echo "Policy already attached to user."
+              
+              echo "Creating service account for user 'dag-runner'..."
+              mc admin user svcacct add helios dag-runner \
+                --access-key "dag-runner-key" \
+                --secret-key "dag-runner-secret" || echo "Service account already exists."
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: access-key
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: minio-credentials
+                  key: secret-key
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: helios-scheduler-sa
+  namespace: helios
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: helios
+  name: job-manager-role
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: job-manager-binding
+  namespace: helios
+subjects:
+  - kind: ServiceAccount
+    name: helios-scheduler-sa
+roleRef:
+  kind: Role
+  name: job-manager-role
+  apiGroup: rbac.authorization.k8s.io

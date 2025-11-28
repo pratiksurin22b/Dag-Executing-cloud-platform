@@ -1,0 +1,97 @@
+apiVersion: v1
+dagName: "minio-producer-consumer-no-artifacts"
+
+artifactRepository:
+  archive:
+    s3:
+      bucket: "helios-artifacts"
+      endpoint: "minio.helios.svc.cluster.local:9000"
+      insecure: true
+      accessKeySecret:
+        name: "minio-credentials"
+        key: "access-key"
+      secretKeySecret:
+        name: "minio-credentials"
+        key: "secret-key"
+
+tasks:
+  - name: "write-and-upload-message"
+    serviceAccountName: "helios-scheduler-sa"
+    type: "command"
+    image: "python:3.9-slim"
+    env:
+      - name: MINIO_ACCESS_KEY
+        value: "minio-access-key"
+      - name: MINIO_SECRET_KEY
+        value: "minio-secret-key"
+    command:
+      - "sh"
+      - "-c"
+      - |
+        set -e
+
+        echo "Using MinIO access key: ${MINIO_ACCESS_KEY:-minio-access-key}"
+        echo "Using MinIO secret key: ${MINIO_SECRET_KEY:-minio-secret-key}"
+
+        echo "Installing curl..."
+        apt-get update && apt-get install -y curl
+
+        echo "Downloading MinIO client (mc)..."
+        curl -sSL -o mc https://dl.min.io/client/mc/release/linux-amd64/mc
+        chmod +x mc
+
+        echo "Configuring MinIO client alias..."
+        ./mc alias set helios-storage http://minio.helios.svc.cluster.local:9000 ${MINIO_ACCESS_KEY:-minio-access-key} ${MINIO_SECRET_KEY:-minio-secret-key}
+
+        echo "Creating local message file..."
+        cat << 'EOF' > message.txt
+        Hello from task 1!
+        This message was written by the producer task and stored in MinIO.
+        EOF
+
+        echo "Uploading message.txt to MinIO..."
+        ./mc cp message.txt helios-storage/helios-artifacts/dags/simple-minio-demo/message.txt
+
+        echo "Upload finished successfully."
+
+  - name: "download-and-print-message"
+    serviceAccountName: "helios-scheduler-sa"
+    type: "command"
+    image: "python:3.9-slim"
+    depends_on: ["write-and-upload-message"]
+    env:
+      - name: MINIO_ACCESS_KEY
+        value: "minio-access-key"
+      - name: MINIO_SECRET_KEY
+        value: "minio-secret-key"
+    command:
+      - "sh"
+      - "-c"
+      - |
+        set -e
+
+        echo "Using MinIO access key: ${MINIO_ACCESS_KEY:-minio-access-key}"
+        echo "Using MinIO secret key: ${MINIO_SECRET_KEY:-minio-secret-key}"
+
+        echo "Installing curl..."
+        apt-get update && apt-get install -y curl
+
+        echo "Downloading MinIO client (mc)..."
+        curl -sSL -o mc https://dl.min.io/client/mc/release/linux-amd64/mc
+        chmod +x mc
+
+        echo "Configuring MinIO client alias..."
+        ./mc alias set helios-storage http://minio.helios.svc.cluster.local:9000 ${MINIO_ACCESS_KEY:-minio-access-key} ${MINIO_SECRET_KEY:-minio-secret-key}
+
+        echo "Downloading message from MinIO..."
+        ./mc cp helios-storage/helios-artifacts/dags/simple-minio-demo/message.txt message.txt
+
+        if [ ! -f "message.txt" ]; then
+          echo "Error: message.txt was not downloaded from MinIO."
+          exit 1
+        fi
+
+        echo ""
+        echo "=== Message received by task 2 ==="
+        cat message.txt
+        echo "=== End of message ==="

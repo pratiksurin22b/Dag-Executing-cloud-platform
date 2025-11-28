@@ -1,0 +1,62 @@
+apiVersion: v1
+dagName: "minio-public-primes-dag"
+artifactRepository:
+  archive:
+    s3:
+      bucket: "helios-artifacts"
+      endpoint: "http://minio.helios.svc.cluster.local:9000"
+      insecure: true
+
+tasks:
+  - name: "calculate-primes-and-upload"
+    serviceAccountName: "helios-scheduler-sa"
+    type: "command"
+    image: "python:3.9-slim"
+    command:
+      - "sh"
+      - "-c"
+      - |
+        set -e
+        apt-get update && apt-get install -y curl
+        curl -sSL -o /tmp/mc https://dl.min.io/client/mc/release/linux-amd64/mc
+        chmod +x /tmp/mc
+        python - <<EOF
+        n = 200000
+        primes = [True] * (n + 1)
+        primes[0] = primes[1] = False
+        for i in range(2, int(n**0.5) + 1):
+          if primes[i]:
+            for multiple in range(i*i, n + 1, i):
+              primes[multiple] = False
+          prime_numbers = [i for i, is_prime in enumerate(primes) if is_prime]
+        with open('/tmp/primes.txt', 'w') as f:
+          for p in prime_numbers:
+            f.write(str(p) + '\n')
+          print(f"Generated {len(prime_numbers)} primes.")
+          EOF
+          /tmp/mc alias set helios-storage http://minio.helios.svc.cluster.local:9000
+          /tmp/mc cp /tmp/primes.txt helios-storage/helios-artifacts/dags/primes.txt
+        echo "Upload complete."
+
+      - name: "download-and-summarize-primes"
+        serviceAccountName: "helios-scheduler-sa"
+        type: "command"
+        image: "python:3.9-slim"
+        depends_on: ["calculate-primes-and-upload"]
+        command:
+          - "sh"
+          - "-c"
+          - |
+            set -e
+            apt-get update && apt-get install -y curl
+            curl -sSL -o /tmp/mc https://dl.min.io/client/mc/release/linux-amd64/mc
+            chmod +x /tmp/mc
+            /tmp/mc alias set helios-storage http://minio.helios.svc.cluster.local:9000
+            /tmp/mc cp helios-storage/helios-artifacts/dags/primes.txt /tmp/primes.txt
+            python - <<EOF
+            with open('/tmp/primes.txt', 'r') as f:
+              primes = [int(line.strip()) for line in f.readlines()]
+            print(f"Total primes: {len(primes)}")
+            print(f"Largest prime: {primes[-1]}")
+            EOF
+              echo "Summary complete."
