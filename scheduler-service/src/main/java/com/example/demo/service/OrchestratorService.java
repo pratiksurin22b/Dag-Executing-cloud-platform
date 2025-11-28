@@ -72,6 +72,9 @@ public class OrchestratorService {
 
     // Base directory inside task containers for artifact files
     private static final String ARTIFACTS_DIR = "/artifacts";
+    
+    // Cache directory for artifacts
+    private static final String CACHE_DIR = "/cache";
 
 
     @Autowired
@@ -682,6 +685,65 @@ public class OrchestratorService {
                 .name("artifacts-workdir")
                 .mountPath(ARTIFACTS_DIR);
 
+        V1VolumeMount cacheMount = new V1VolumeMount()
+                .name("cache-volume")
+                .mountPath(CACHE_DIR);
+
+        V1Volume cacheVolume = new V1Volume()
+                .name("cache-volume")
+                .emptyDir(new V1EmptyDirVolumeSource());
+
+        // Init script that handles artifact downloading with proper empty input handling (version 3.0)
+        String initScript = String.join("\n",
+                "set -e",
+                "echo '[HELIOS] Running init script version 3.0 (POSIX compliant).'",
+                "echo '[HELIOS] Init container starting for task ' \"$HELIOS_TASK_NAME\"",
+                "if [ -n \"$HELIOS_INPUT_ARTIFACTS\" ]; then",
+                "  echo \"$HELIOS_INPUT_ARTIFACTS\" | while IFS=';' read -r ARTIFACT_PAIRS; do",
+                "    for pair in $ARTIFACT_PAIRS; do",
+                "      [ -z \"$pair\" ] && continue",
+                "      name=\"${pair%%=*}\"",
+                "      key=\"${pair#*=}\"",
+                "      fileName=\"$(basename \"$key\")\"",
+                "      workspacePath=\"$HELIOS_ARTIFACTS_DIR/$name\"",
+                "      cachePath=\"$HELIOS_CACHE_DIR/$HELIOS_DAG_ID/$name/$fileName\"",
+                "      mkdir -p \"$(dirname \"$cachePath\")\" \"$(dirname \"$workspacePath\")\"",
+                "      if [ \"$HELIOS_CACHE_ENABLED\" = 'true' ] && [ -f \"$cachePath\" ]; then",
+                "        echo '[HELIOS] Cache hit for ' \"$key\" ' -> ' \"$cachePath\"",
+                "        cp -f \"$cachePath\" \"$workspacePath\"",
+                "        continue",
+                "      fi",
+                "      echo '[HELIOS] Cache miss for ' \"$key\" '; downloading from MinIO...'",
+                "      tmpFile=\"$cachePath.tmp\"",
+                "      rm -f \"$tmpFile\"",
+                "      curl -sS --fail --retry 3 --connect-timeout 30 \\",
+                "        \"$HELIOS_ARTIFACTS_ENDPOINT/$HELIOS_ARTIFACTS_BUCKET/$key\" -o \"$tmpFile\" || {",
+                "          echo '[HELIOS] ERROR: Download failed for ' \"$key\" ; exit 1; }",
+                "      mv \"$tmpFile\" \"$cachePath\"",
+                "      cp -f \"$cachePath\" \"$workspacePath\"",
+                "    done",
+                "  done",
+                "fi",
+                "echo '[HELIOS] Init container completed.'"
+        );
+
+        V1Container initContainer = new V1Container()
+                .name("init-artifacts")
+                .image("curlimages/curl:latest")
+                .command(Arrays.asList("/bin/sh", "-c", initScript))
+                .addVolumeMountsItem(artifactsMount)
+                .addVolumeMountsItem(cacheMount)
+                .addEnvItem(new V1EnvVar().name("HELIOS_DAG_ID").value(dagId))
+                .addEnvItem(new V1EnvVar().name("HELIOS_TASK_NAME").value(taskName))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_DIR").value(ARTIFACTS_DIR))
+                .addEnvItem(new V1EnvVar().name("HELIOS_CACHE_DIR").value(CACHE_DIR))
+                .addEnvItem(new V1EnvVar().name("HELIOS_CACHE_ENABLED").value("false"))
+                .addEnvItem(new V1EnvVar().name("HELIOS_INPUT_ARTIFACTS").value(inputArtifactsSpec))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_ENDPOINT").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_ENDPOINT", "http://minio:9000")))
+                .addEnvItem(new V1EnvVar().name("HELIOS_ARTIFACTS_BUCKET").value(
+                        System.getenv().getOrDefault("HELIOS_ARTIFACTS_BUCKET", "helios-artifacts")));
+
         V1Container container = new V1Container()
                 .name(cleanTaskNameK8s.substring(0, Math.min(cleanTaskNameK8s.length(), 50)) + "-cont")
                 .image(image)
@@ -704,6 +766,8 @@ public class OrchestratorService {
         V1PodSpec podSpec = new V1PodSpec()
                 .restartPolicy("Never")
                 .addVolumesItem(artifactsVolume)
+                .addVolumesItem(cacheVolume)
+                .addInitContainersItem(initContainer)
                 .addContainersItem(container);
 
         V1PodTemplateSpec template = new V1PodTemplateSpec()
