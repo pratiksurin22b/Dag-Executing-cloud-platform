@@ -14,32 +14,42 @@ spec:
       labels:
         app: helios-cache-prep
     spec:
-      # This pod prepares /var/helios/cache on every node for hostPath caching
+      hostPID: true # CRITICAL: Allows us to see the Host's Init process (PID 1)
       tolerations:
-        - operator: "Exists"  # allow running on tainted nodes (masters etc.)
+        - operator: "Exists" # Run on all nodes
       containers:
         - name: cache-prep
           image: alpine:3.19
           securityContext:
-            privileged: true
+            privileged: true # CRITICAL: Required to enter host namespace
           command:
             - /bin/sh
             - -c
             - |
               set -e
-              echo "[HELIOS] Preparing /var/helios/cache on host..."
-              mkdir -p /host/var/helios/cache
-              # Default to permissive; can be tightened later if you run non-root with matching UID/GID
-              chmod 777 /host/var/helios/cache
-              echo "[HELIOS] /var/helios/cache prepared on host $(hostname)."
-              # Keep the pod running so DaemonSet stays healthy
+              echo "[HELIOS] Entering Host Namespace to mount RAM disk..."
+              
+              # 'nsenter' allows us to run commands AS the Host OS (Targeting PID 1)
+              # This bypasses the Volume Propagation error entirely.
+              nsenter --target 1 --mount -- sh -c '
+                set -e
+                CACHE_DIR="/var/helios/ram-cache"
+              
+                # 1. Create Directory on Host
+                mkdir -p "$CACHE_DIR"
+              
+                # 2. Mount tmpfs (RAM) if not exists
+                if mount | grep -q "$CACHE_DIR"; then
+                   echo "[HOST] RAM cache already mounted at $CACHE_DIR"
+                else
+                   # Mount 2GB RAM disk
+                   mount -t tmpfs -o size=2G tmpfs "$CACHE_DIR"
+                   echo "[HOST] Mounted tmpfs (RAM) at $CACHE_DIR"
+                fi
+              
+                # 3. Set Permissions for Pod access
+                chmod 777 "$CACHE_DIR"
+              '
+              
+              echo "[HELIOS] Host preparation complete. Sleeping..."
               tail -f /dev/null
-          volumeMounts:
-            - name: host-root
-              mountPath: /host
-      volumes:
-        - name: host-root
-          hostPath:
-            path: /
-            type: Directory
-

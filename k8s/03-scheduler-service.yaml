@@ -20,7 +20,7 @@ spec:
       containers:
         - name: scheduler-service
           # Updated to match the latest pushed image tag
-          image: pratik9634/scheduler-service:re
+          image: pratik9634/scheduler-service:cacheandui3
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
